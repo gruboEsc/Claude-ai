@@ -10,8 +10,9 @@ BETAS = [
     "compact-2026-01-12",  # server-side compaction of very long dialogs
     "thinking-binding-controls-2026-08-01",  # drop stale thinking instead of failing (see THINKING)
 ]
-# If the bot's system prompt or tool set changes between deploys, thinking blocks in
-# older dialogs no longer match their prefix; dropping them keeps those dialogs working.
+# When a dialog's system prompt is refreshed (new memories after a compaction, a bot
+# update), older thinking blocks no longer match their prefix; dropping them keeps
+# the dialog working instead of failing the request.
 THINKING = {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}}
 MAX_STEPS = 8  # model calls per reply: pause_turn resumes and client tool rounds
 
@@ -32,7 +33,7 @@ class Reply:
     turns: list[dict] = field(default_factory=list)  # turns to append to history, in order
     refused: bool = False
     truncated: bool = False
-    searches: int = 0
+    compacted: bool = False
     input_tokens: int = 0
     output_tokens: int = 0
     cached_tokens: int = 0
@@ -45,25 +46,33 @@ def cost(model: str, inp: int, out: int, cached: int) -> float | None:
     return (inp * p_in + out * p_out + cached * p_cache) / 1_000_000
 
 
+async def _ignore(_: str) -> None:
+    pass
+
+
 class Claude:
-    def __init__(self, cfg: Config, tools: list[dict]):
+    def __init__(self, cfg: Config, tools: list[dict], compaction_instructions: str | None = None):
         self.cfg = cfg
         self.client = AsyncAnthropic(api_key=cfg.anthropic_api_key)
         # Fixed for the life of the process: a tool set that changed mid-dialog
         # would restart the prompt cache.
         self.tools = list(tools)
         if cfg.web_search:
-            self.tools.append({"type": "web_search_20260209", "name": "web_search", "max_uses": 5})
+            self.tools.append({"type": "web_search_20260209", "name": "web_search", "max_uses": 3})
+        compact = {"type": "compact_20260112"}
+        if compaction_instructions:
+            compact["instructions"] = compaction_instructions
+        self.context_management = {"edits": [compact]}
 
     async def reply(
         self,
         system: str,
         history: list[dict],
         effort: str,
-        on_text: Callable[[str], Awaitable[None]],
         run_tool: ToolRunner,
+        on_text: Callable[[str], Awaitable[None]] = _ignore,
     ) -> Reply:
-        """Stream one assistant reply for `history` (which ends with the new user turn)."""
+        """Run one assistant reply for `history` (which ends with the new user turn)."""
         result = Reply()
         messages = list(history)
 
@@ -79,7 +88,7 @@ class Claude:
                 thinking=THINKING,
                 output_config={"effort": effort},
                 cache_control={"type": "ephemeral"},
-                context_management={"edits": [{"type": "compact_20260112"}]},
+                context_management=self.context_management,
                 fallbacks="default",
                 betas=BETAS,
             ) as stream:
@@ -92,8 +101,6 @@ class Claude:
             result.input_tokens += usage.input_tokens + (usage.cache_creation_input_tokens or 0)
             result.cached_tokens += usage.cache_read_input_tokens or 0
             result.output_tokens += usage.output_tokens
-            if usage.server_tool_use:
-                result.searches += usage.server_tool_use.web_search_requests or 0
 
             if message.stop_reason == "refusal":
                 result.refused = True
@@ -105,6 +112,7 @@ class Claude:
                 "role": "assistant",
                 "content": [b.model_dump(mode="json", by_alias=True, exclude_none=True) for b in message.content],
             }
+            result.compacted |= any(b.type == "compaction" for b in message.content)
             result.turns.append(turn)
             messages.append(turn)
 

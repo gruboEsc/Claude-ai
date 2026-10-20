@@ -1,49 +1,48 @@
 import asyncio
 import logging
-from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
 from aiogram.types import BotCommand
 
-from . import reminders
+from .brain import Companion
 from .claude import Claude
+from .companion import COMPACTION_INSTRUCTIONS
 from .config import Config
 from .db import Storage
 from .handlers import setup
+from .tools import TOOLS, Tools
 
 COMMANDS = [
-    BotCommand(command="new", description="🧹 Новый диалог"),
-    BotCommand(command="mode", description="🎭 Режим: программист, переводчик…"),
-    BotCommand(command="effort", description="🧠 Глубина размышлений"),
-    BotCommand(command="reminders", description="⏰ Мои напоминания"),
-    BotCommand(command="export", description="📥 Скачать диалог"),
-    BotCommand(command="stats", description="📊 Статистика и расходы"),
-    BotCommand(command="help", description="❓ Справка"),
+    BotCommand(command="status", description="⭐ Подписка"),
+    BotCommand(command="settings", description="⚙️ Писать ли мне первым"),
+    BotCommand(command="forget", description="🧹 Стереть всё"),
+    BotCommand(command="help", description="❓ Помощь"),
+    BotCommand(command="terms", description="📄 Условия"),
+    BotCommand(command="paysupport", description="💳 Помощь с оплатой"),
 ]
 
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = Config.from_env()
-    if not cfg.allowed_users:
-        logging.warning("ALLOWED_USERS пуст — бот отвечает всем, и платишь за это ты")
+    if not cfg.admin_ids:
+        logging.warning("ADMIN_IDS пуст — команда /admin никому не доступна")
 
     storage = Storage(cfg.db_path)
     await storage.open()
-    remind = reminders.Reminders(storage, ZoneInfo(cfg.timezone))
+    claude = Claude(cfg, TOOLS, COMPACTION_INSTRUCTIONS)
+    companion = Companion(cfg, storage, claude, Tools(storage, cfg.timezone))
 
-    bot = Bot(cfg.telegram_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot = Bot(cfg.telegram_token)
     dp = Dispatcher()
-    dp.include_router(setup(cfg, storage, Claude(cfg, reminders.TOOLS), remind))
+    dp.include_router(setup(cfg, companion))
     await bot.set_my_commands(COMMANDS)
-    delivery = asyncio.create_task(remind.deliver_forever(bot))
+    scheduler = asyncio.create_task(companion.run_forever(bot))
 
     try:
         await dp.start_polling(bot)
     finally:
-        delivery.cancel()
+        scheduler.cancel()
         await storage.close()
         await bot.session.close()
 
