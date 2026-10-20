@@ -26,7 +26,11 @@ CREATE TABLE IF NOT EXISTS users (
     autopay INTEGER NOT NULL DEFAULT 0,
     awaiting_email INTEGER NOT NULL DEFAULT 0,   -- plan days to pay for once the email arrives
     plan_days INTEGER NOT NULL DEFAULT 30,       -- length of the plan last paid for
-    lang TEXT                                    -- interface and companion language (i18n.LANGS)
+    lang TEXT,                                   -- interface and companion language (i18n.LANGS)
+    -- Which messenger the person uses. Telegram users keep their Telegram id as user_id;
+    -- people from other messengers get negative ids so the two can never collide.
+    platform TEXT NOT NULL DEFAULT 'telegram',
+    external_id TEXT
 );
 CREATE TABLE IF NOT EXISTS dialog (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,6 +87,8 @@ MIGRATIONS = {
         ("awaiting_email", "INTEGER NOT NULL DEFAULT 0"),
         ("plan_days", "INTEGER NOT NULL DEFAULT 30"),
         ("lang", "TEXT"),
+        ("platform", "TEXT NOT NULL DEFAULT 'telegram'"),
+        ("external_id", "TEXT"),
     ],
     "yk_payments": [("days", "INTEGER NOT NULL DEFAULT 30")],
 }
@@ -113,6 +119,8 @@ class User:
     awaiting_email: int
     plan_days: int
     lang: str | None
+    platform: str
+    external_id: str | None
 
 
 class Storage:
@@ -133,6 +141,12 @@ class Storage:
                     if (table, col) == ("users", "lang"):
                         # Everyone from before languages existed used the Russian-only bot.
                         await self.conn.execute("UPDATE users SET lang = 'ru'")
+        await self.conn.execute(
+            "UPDATE users SET external_id = CAST(user_id AS TEXT) WHERE external_id IS NULL AND platform = 'telegram'"
+        )
+        await self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS users_account ON users(platform, external_id)"
+        )
         await self.conn.commit()
 
     async def close(self) -> None:
@@ -151,9 +165,26 @@ class Storage:
     # users
 
     async def user(self, user_id: int) -> User:
-        await self._exec("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        # Only Telegram users are created implicitly here (their id is their Telegram id);
+        # other messengers go through account().
+        await self._exec(
+            "INSERT OR IGNORE INTO users (user_id, external_id) VALUES (?, CAST(? AS TEXT))", (user_id, user_id)
+        )
         cur = await self.conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
         return User(*await cur.fetchone())
+
+    async def account(self, platform: str, external_id: str) -> int:
+        """The internal user id for a person on a non-Telegram messenger, created on first contact."""
+        rows = await self._all(
+            "SELECT user_id FROM users WHERE platform = ? AND external_id = ?", (platform, external_id)
+        )
+        if rows:
+            return rows[0][0]
+        (new_id,), = await self._all("SELECT COALESCE(MIN(user_id), 0) - 1 FROM users WHERE user_id < 0")
+        await self._exec(
+            "INSERT INTO users (user_id, platform, external_id) VALUES (?, ?, ?)", (new_id, platform, external_id)
+        )
+        return new_id
 
     async def is_new(self, user_id: int) -> bool:
         return not await self._all("SELECT 1 FROM users WHERE user_id = ?", (user_id,))

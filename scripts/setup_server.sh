@@ -6,6 +6,11 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+# With a DOMAIN in .env, also run the HTTPS proxy for webhooks (LINE).
+compose_profiles() {
+    if grep -qE '^DOMAIN=.+' .env 2>/dev/null; then echo "--profile web"; fi
+}
 DIR="$(pwd)"
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -26,7 +31,7 @@ fi
 
 mkdir -p data backups
 echo "==> Собираю и запускаю бота"
-docker compose up -d --build
+docker compose $(compose_profiles) up -d --build
 
 echo "==> Ставлю ежедневный бэкап базы (04:00)"
 cat > /etc/cron.d/companion-bot-backup <<EOF
@@ -34,6 +39,10 @@ cat > /etc/cron.d/companion-bot-backup <<EOF
 EOF
 chmod 644 /etc/cron.d/companion-bot-backup
 
+domain=$(grep -E '^DOMAIN=' .env | cut -d= -f2-)
+if [ -n "$domain" ]; then
+    echo "HTTPS включён. Вебхук для LINE: https://$domain/line/webhook"
+fi
 echo
 echo "Готово! Бот работает и сам перезапустится после сбоя или перезагрузки сервера."
 echo "  Логи:        docker compose logs -f"

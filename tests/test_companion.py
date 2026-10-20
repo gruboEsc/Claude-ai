@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from bot.brain import Companion, bubbles
+from bot.channels import Channel
 from bot.claude import Claude, Reply, cost
 from bot.companion import build_system, stamp
 from bot.config import Config
@@ -21,15 +22,15 @@ def run(coro):
     return asyncio.run(coro)
 
 
-class FakeBot:
+class FakeBot(Channel):
+    name = "telegram"
+
     def __init__(self):
         self.sent = []
 
-    async def send_message(self, chat_id, text, **_):
-        self.sent.append((chat_id, text))
-
-    async def send_chat_action(self, *_):
-        pass
+    async def send(self, external_id, parts):
+        self.sent.extend((int(external_id), part) for part in parts)
+        return True
 
 
 class FakeClaude:
@@ -46,15 +47,15 @@ class FakeClaude:
 async def _setup(tmp_path, claude=None):
     storage = Storage(str(tmp_path / "bot.db"))
     await storage.open()
-    companion = Companion(CFG, storage, claude or FakeClaude(), Tools(storage, CFG.timezone))
+    companion = Companion(CFG, storage, claude or FakeClaude(), Tools(storage, CFG.timezone), [FakeBot()])
     return storage, companion
 
 
 def test_conversation_is_saved_and_split_into_bubbles(tmp_path):
     async def scenario():
         storage, companion = await _setup(tmp_path)
-        bot = FakeBot()
-        assert await companion.converse(bot, 7, [{"type": "text", "text": "привет"}])
+        bot = companion.channels["telegram"]
+        assert await companion.converse(7, [{"type": "text", "text": "привет"}])
         assert bot.sent == [(7, "Привет!"), (7, "Как ты?")]
         history = await storage.history(7)
         assert [t["role"] for t in history] == ["user", "assistant"]
@@ -62,7 +63,7 @@ def test_conversation_is_saved_and_split_into_bubbles(tmp_path):
         assert await storage.notes(7) == [(1, "любит котов")]
         # the system prompt is frozen for the dialog: the new note is not in it yet
         system_before = companion.claude.calls[0][0]
-        await companion.converse(bot, 7, [{"type": "text", "text": "ещё"}])
+        await companion.converse(7, [{"type": "text", "text": "ещё"}])
         assert companion.claude.calls[1][0] == system_before
         assert companion.claude.calls[1][1][:2] == history  # append-only
         await storage.close()
@@ -91,7 +92,7 @@ def test_trial_and_subscription(tmp_path):
 def test_checkin_only_for_idle_subscribers_and_capped(tmp_path):
     async def scenario():
         storage, companion = await _setup(tmp_path)
-        bot = FakeBot()
+        bot = companion.channels["telegram"]
         now = int(time.time())
         long_ago = now - 30 * 3600
         await storage.user(1)
@@ -101,17 +102,17 @@ def test_checkin_only_for_idle_subscribers_and_capped(tmp_path):
         await storage.user(3)
         await storage.update(3, paid_until=now + 86400, last_user_at=now - 60)  # active
 
-        await companion.tick(bot)
+        await companion.tick()
         assert [uid for uid, _ in bot.sent] == [1, 1]
         note = companion.claude.calls[0][1][-1]["content"][1]["text"]
         assert note.startswith("[Service note") and "30 h" in note
         # just wrote, so no second check-in right away
         bot.sent.clear()
-        await companion.tick(bot)
+        await companion.tick()
         assert bot.sent == []
         # after two unanswered check-ins it stops
         await storage.update(1, last_bot_at=long_ago, unanswered=2)
-        await companion.tick(bot)
+        await companion.tick()
         assert bot.sent == []
         await storage.close()
 
@@ -121,11 +122,11 @@ def test_checkin_only_for_idle_subscribers_and_capped(tmp_path):
 def test_planned_message_is_delivered_once(tmp_path):
     async def scenario():
         storage, companion = await _setup(tmp_path)
-        bot = FakeBot()
+        bot = companion.channels["telegram"]
         await storage.user(5)
         await storage.plan(5, int(time.time()) - 1, "спросить, как прошло собеседование")
-        await companion.tick(bot)
-        await companion.tick(bot)
+        await companion.tick()
+        await companion.tick()
         assert len(companion.claude.calls) == 1
         assert "собеседование" in companion.claude.calls[0][1][-1]["content"][1]["text"]
         await storage.close()

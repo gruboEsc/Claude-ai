@@ -452,6 +452,33 @@ STRINGS: dict[str, dict[str, str]] = {
                      "hi": "ठीक है, अब हिन्दी में बात करेंगे 🙂", "kk": "Дайын, қазақша сөйлесеміз 🙂",
                      "uz": "Tayyor, o'zbekcha gaplashamiz 🙂", "ja": "OK、日本語で話そう 🙂", "ko": "좋아요, 한국어로 이야기해요 🙂",
                      "zh": "好的，我们用中文聊 🙂"},
+    # LINE (no in-chat payments yet, and text commands instead of bot commands).
+    "line_paywall": {
+        "ru": "Бесплатные сообщения закончились. Подписка в LINE скоро появится — я напишу, как только можно будет продолжить.",
+        "en": "Your free messages are used up. Subscriptions on LINE are coming soon — I'll let you know as soon as we can continue.",
+        "ja": "無料メッセージを使い切りました。LINEでのサブスクリプションはもうすぐ始まります。続けられるようになったらお知らせするね。",
+        "ko": "무료 메시지를 모두 사용했어요. LINE 구독은 곧 시작돼요. 다시 이야기할 수 있게 되면 알려 줄게요.",
+        "zh": "免费消息已用完。LINE 订阅即将上线——可以继续聊天时我会告诉你。",
+    },
+    "line_trial": {
+        "ru": "Бесплатных сообщений осталось: {left} из {free}. Подписка в LINE скоро появится.",
+        "en": "Free messages left: {left} of {free}. Subscriptions on LINE are coming soon.",
+        "ja": "残りの無料メッセージ：{left} / {free}。LINEでのサブスクリプションはもうすぐ始まります。",
+        "ko": "남은 무료 메시지: {left} / {free}. LINE 구독은 곧 시작돼요.",
+        "zh": "剩余免费消息：{left} / {free}。LINE 订阅即将上线。",
+    },
+    "line_help": {
+        "ru": "Просто пиши — {name} ответит. Можно присылать фото.\n\n/status — сообщения и подписка\n/settings — писать ли "
+              "тебе первым\n/language — язык\n/forget — стереть всё",
+        "en": "Just write — {name} will reply. You can send photos too.\n\n/status — messages and subscription\n"
+              "/settings — whether to write first\n/language — language\n/forget — erase everything",
+        "ja": "気軽にメッセージしてね — {name}が返事します。写真も送れます。\n\n/status — メッセージとサブスク\n"
+              "/settings — こちらからの連絡\n/language — 言語\n/forget — すべて消去",
+        "ko": "편하게 메시지를 보내 주세요 — {name}이(가) 답할게요. 사진도 보낼 수 있어요.\n\n/status — 메시지와 구독\n"
+              "/settings — 먼저 연락하기\n/language — 언어\n/forget — 모두 지우기",
+        "zh": "直接发消息——{name}会回复你。也可以发照片。\n\n/status — 消息和订阅\n/settings — 主动问候\n"
+              "/language — 语言\n/forget — 全部清除",
+    },
     # YooKassa is offered to Russian-speaking users only.
     "pay_link": {"ru": "Подписка на {days} дней — {rub} ₽. Чек придёт на {email}.{consent}\n\nПосле оплаты вернись сюда — "
                        "я сам замечу платёж в течение минуты, или нажми «Я оплатил»."},

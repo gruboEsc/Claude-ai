@@ -51,6 +51,10 @@ class Config:
     avg_daily_usd: float = 0.30  # budget for the paid period = days x this
     daily_limit_usd_t2: float = 0.20
     avg_daily_usd_t2: float = 0.10
+    # LINE (Japan, Taiwan, Thailand); off while the channel secret or token is empty
+    line_secret: str = ""
+    line_token: str = ""
+    web_port: int = 8080  # webhook server for LINE, behind the HTTPS proxy
     # The companion writing first
     checkins: bool = True
     checkin_after_hours: int = 20
@@ -99,6 +103,9 @@ class Config:
             avg_daily_usd=float(os.getenv("AVG_DAILY_LIMIT_USD", "0.30")),
             daily_limit_usd_t2=float(os.getenv("DAILY_LIMIT_USD_T2", "0.20")),
             avg_daily_usd_t2=float(os.getenv("AVG_DAILY_LIMIT_USD_T2", "0.10")),
+            line_secret=os.getenv("LINE_CHANNEL_SECRET", ""),
+            line_token=os.getenv("LINE_CHANNEL_ACCESS_TOKEN", ""),
+            web_port=int(os.getenv("WEB_PORT", "8080")),
             checkins=_flag("CHECKINS", "1"),
             checkin_after_hours=int(os.getenv("CHECKIN_AFTER_HOURS", "20")),
             checkin_from_hour=int(os.getenv("CHECKIN_FROM_HOUR", "10")),

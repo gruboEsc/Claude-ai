@@ -38,13 +38,17 @@ class FakeYK:
                 "payment_method": {"id": "card-1", "saved": True}}
 
 
-class Me:
-    username = "companion_bot"
+RETURN = "https://t.me/companion_bot"
 
 
-class Bot(FakeBot):
-    async def get_me(self):
-        return Me()
+class Bot:
+    """Collects the payment notices Billing sends."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def notify(self, user_id, text):
+        self.sent.append((user_id, text))
 
 
 async def _storage(tmp_path) -> Storage:
@@ -57,30 +61,30 @@ def test_payment_by_link_extends_once(tmp_path):
     async def scenario():
         storage = await _storage(tmp_path)
         yk = FakeYK()
-        billing = Billing(CFG, storage, yk)
         bot = Bot()
+        billing = Billing(CFG, storage, yk, notify=bot.notify)
         await storage.user(1)
-        url = await billing.start(bot, 1, "a@b.ru", PLANS[30])
+        url = await billing.start(1, "a@b.ru", PLANS[30], RETURN)
         assert url.endswith("/p1")
         assert yk.created[0]["email"] == "a@b.ru" and yk.created[0]["rub"] == 1790
         assert yk.created[0]["return_url"] == "https://t.me/companion_bot"
 
-        assert not await billing.check_user(bot, 1)  # still pending
+        assert not await billing.check_user(1)  # still pending
         yk.status["p1"] = "succeeded"
-        assert await billing.check_user(bot, 1)
+        assert await billing.check_user(1)
         paid_until = (await storage.user(1)).paid_until
         assert abs(paid_until - (time.time() + 30 * DAY)) < 5
-        await billing.tick(bot)  # already settled: no second extension
+        await billing.tick()  # already settled: no second extension
         assert (await storage.user(1)).paid_until == paid_until
         assert "Спасибо" in bot.sent[0][1] and len(bot.sent) == 1
         # autopay is off by default, so the card is not kept
         assert (await storage.user(1)).autopay == 0
 
         # a two-week plan bought on top adds 14 days and becomes the current plan
-        await billing.start(bot, 1, "a@b.ru", PLANS[14])
+        await billing.start(1, "a@b.ru", PLANS[14], RETURN)
         assert yk.created[1]["rub"] == 990 and "14 дней" in yk.created[1]["description"]
         yk.status["p2"] = "succeeded"
-        await billing.tick(bot)
+        await billing.tick()
         user = await storage.user(1)
         assert user.paid_until == paid_until + 14 * DAY and user.plan_days == 14
         await storage.close()
@@ -92,27 +96,27 @@ def test_autopay_renewal_and_decline(tmp_path):
     async def scenario():
         storage = await _storage(tmp_path)
         yk = FakeYK()
-        billing = Billing(replace(CFG, yk_autopay=True), storage, yk)
         bot = Bot()
+        billing = Billing(replace(CFG, yk_autopay=True), storage, yk, notify=bot.notify)
         await storage.user(2)
         await storage.update(2, email="c@d.ru")
-        await billing.start(bot, 2, "c@d.ru", PLANS[14])
+        await billing.start(2, "c@d.ru", PLANS[14], RETURN)
         assert yk.created[0]["save_method"] is True
         yk.status["p1"] = "succeeded"
-        await billing.tick(bot)
+        await billing.tick()
         user = await storage.user(2)
         assert (user.autopay, user.pay_method_id) == (1, "card-1")
 
         # near the end of the period the saved card is charged, once
         await storage.update(2, paid_until=int(time.time()) + 3600)
-        await billing.tick(bot)
-        await billing.tick(bot)
+        await billing.tick()
+        await billing.tick()
         renewals = [c for c in yk.created if c.get("method_id")]
         assert len(renewals) == 1 and renewals[0]["method_id"] == "card-1"
         assert renewals[0]["rub"] == 990  # renews the plan last chosen
 
         yk.status["p2"] = "canceled"
-        await billing.tick(bot)
+        await billing.tick()
         user = await storage.user(2)
         assert (user.autopay, user.pay_method_id) == (0, None)
         assert "Не получилось продлить" in bot.sent[-1][1]
@@ -124,7 +128,7 @@ def test_autopay_renewal_and_decline(tmp_path):
 def test_spend_limits(tmp_path):
     async def scenario():
         storage = await _storage(tmp_path)
-        companion = Companion(CFG, storage, FakeClaude(), Tools(storage, CFG.timezone))
+        companion = Companion(CFG, storage, FakeClaude(), Tools(storage, CFG.timezone), [FakeBot()])
         now = int(time.time())
         await storage.user(3)
         user = await storage.user(3)
@@ -152,8 +156,7 @@ def test_spend_limits(tmp_path):
         await storage.update(3, paid_until=now + 10 * DAY, plan_days=14)
         assert (await companion.over_limit(await storage.user(3)))[0] == "period"
 
-        bot = FakeBot()
-        await companion.converse(bot, 3, [{"type": "text", "text": "hi"}])
+        await companion.converse(3, [{"type": "text", "text": "hi"}])
         assert await storage.spent(3, today.isoformat()) >= 0.31
         await storage.update(3, paid_until=now - 1)
         assert await companion.over_limit(await storage.user(3)) is None

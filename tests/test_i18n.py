@@ -12,7 +12,7 @@ from bot.db import Storage
 from bot.handlers import setup
 from bot.i18n import LANGS, STRINGS, companion_name, lang_of, t
 from bot.tools import Tools
-from tests.test_companion import FakeClaude
+from tests.test_companion import FakeBot, FakeClaude
 
 # Shown to every user, so every language must have its own text.
 EVERYONE = [
@@ -62,7 +62,7 @@ def _keyboard_for(tmp_path, lang):
         cfg = Config(telegram_token="x", anthropic_api_key="k")
         storage = Storage(str(tmp_path / f"{lang}.db"))
         await storage.open()
-        companion = Companion(cfg, storage, FakeClaude(), Tools(storage, cfg.timezone))
+        companion = Companion(cfg, storage, FakeClaude(), Tools(storage, cfg.timezone), [FakeBot()])
         router = setup(cfg, companion, Billing(cfg, storage, object()))
         handler = next(h.callback for h in router.message.handlers if h.callback.__name__ == "cmd_subscribe")
         out = {}
@@ -104,7 +104,7 @@ def test_tier_two_spend_limits(tmp_path):
         cfg = Config(telegram_token="x", anthropic_api_key="k")
         storage = Storage(str(tmp_path / "t.db"))
         await storage.open()
-        companion = Companion(cfg, storage, FakeClaude(), Tools(storage, cfg.timezone))
+        companion = Companion(cfg, storage, FakeClaude(), Tools(storage, cfg.timezone), [FakeBot()])
         await storage.user(1)
         await storage.update(1, lang="hi", paid_until=int(time.time()) + 86400 * 20, plan_days=30)
         user = await storage.user(1)

@@ -5,10 +5,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-from aiogram import Bot
-from aiogram.enums import ChatAction
-from aiogram.exceptions import TelegramForbiddenError
-
+from .channels import Channel
 from .claude import Claude, usd
 from .companion import build_system, stamp
 from .i18n import LANGS, companion_name, lang_of, t
@@ -24,11 +21,12 @@ TG_LIMIT = 4096
 
 
 class Companion:
-    def __init__(self, cfg: Config, storage: Storage, claude: Claude, tools: Tools):
+    def __init__(self, cfg: Config, storage: Storage, claude: Claude, tools: Tools, channels: list[Channel]):
         self.cfg = cfg
         self.storage = storage
         self.claude = claude
         self.tools = tools
+        self.channels = {channel.name: channel for channel in channels}
         self.locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     def has_access(self, user: User) -> bool:
@@ -74,6 +72,16 @@ class Companion:
             return "period", start_day + timedelta(seconds=period)
         return None
 
+    async def admit(self, user: User) -> tuple[str, dict] | None:
+        """Why this person can't get a reply right now, as an i18n key and its fields; None if they can."""
+        if not self.has_access(user):
+            return "paywall", {}
+        limit = await self.over_limit(user)
+        if limit:
+            kind, resets = limit
+            return ("limit_day", {}) if kind == "day" else ("limit_period", {"date": f"{resets:%d.%m}"})
+        return None
+
     async def _system(self, user: User, refresh: bool = False) -> str:
         # Frozen per dialog so every request shares one cached prefix; rebuilt with the
         # latest notes when a dialog starts and after server-side compaction.
@@ -86,8 +94,15 @@ class Companion:
         await self.storage.update(user.user_id, system=system)
         return system
 
-    async def converse(self, bot: Bot, user_id: int, content: list[dict], proactive: bool = False) -> bool:
-        """Answer one user turn (a real message or a service note). False if nothing was sent."""
+    async def converse(
+        self, user_id: int, content: list[dict], proactive: bool = False, prefix: list[str] | None = None
+    ) -> bool:
+        """Answer one user turn (a real message or a service note). False if nothing was sent.
+
+        `prefix` messages go out first, in the same delivery (on LINE that keeps them in the
+        free reply instead of a paid push).
+        """
+        prefix = prefix or []
         async with self.locks[user_id]:
             user = await self.storage.user(user_id)
             system = await self._system(user)
@@ -98,7 +113,7 @@ class Companion:
             async def run_tool(name: str, args: dict) -> str:
                 return await self.tools.run(user_id, name, args)
 
-            typing = asyncio.create_task(_keep_typing(bot, user_id))
+            typing = asyncio.create_task(self._keep_typing(user))
             try:
                 reply = await self.claude.reply(system, history, self.cfg.effort, run_tool)
             finally:
@@ -112,53 +127,68 @@ class Companion:
             if reply.refused:
                 # Not saved, so the dialog continues as if this turn never happened.
                 if proactive:
-                    return False
-                return await self._send(bot, user_id, [t(self.lang(user), "refusal")])
+                    return await self.send(user, prefix) if prefix else False
+                return await self.send(user, [*prefix, t(self.lang(user), "refusal")])
 
             await self.storage.append(user_id, [user_turn, *reply.turns])
             if reply.compacted:
                 await self._system(user, refresh=True)
-            text = reply.text.strip()
-            if not text:
+            parts = [*prefix, *bubbles(reply.text.strip())] if reply.text.strip() else prefix
+            if not parts:
                 return False
-            return await self._send(bot, user_id, bubbles(text))
+            return await self.send(user, parts)
 
-    async def _send(self, bot: Bot, user_id: int, parts: list[str]) -> bool:
-        try:
-            for i, part in enumerate(parts):
-                if i:
-                    # Type each follow-up for a moment, like a person sending several messages.
-                    await bot.send_chat_action(user_id, ChatAction.TYPING)
-                    await asyncio.sleep(min(1.0 + len(part) / 40, 4.0))
-                await bot.send_message(user_id, part, parse_mode=None)
-        except TelegramForbiddenError:
-            await self.storage.update(user_id, blocked=1)
+    async def send(self, user: User, parts: list[str]) -> bool:
+        """Deliver messages through the person's messenger; marks them blocked if it refuses."""
+        channel = self.channels.get(user.platform)
+        if channel is None:
+            log.warning("no %s channel configured, can't reach user %s", user.platform, user.user_id)
             return False
-        await self.storage.update(user_id, last_bot_at=int(time.time()))
+        if not await channel.send(user.external_id, parts):
+            await self.storage.update(user.user_id, blocked=1)
+            return False
+        await self.storage.update(user.user_id, last_bot_at=int(time.time()))
         return True
 
-    async def write_first(self, bot: Bot, user_id: int, note: str) -> None:
+    async def notify(self, user_id: int, text: str) -> None:
+        """A one-off service message (e.g. about a payment) outside the dialog."""
+        await self.send(await self.storage.user(user_id), [text])
+
+    async def _keep_typing(self, user: User) -> None:
+        channel = self.channels.get(user.platform)
+        if channel is None:
+            return
         try:
-            await self.converse(bot, user_id, [{"type": "text", "text": note}], proactive=True)
+            while True:
+                await channel.typing(user.external_id)
+                await asyncio.sleep(4.5)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.debug("typing indicator failed", exc_info=True)
+
+    async def write_first(self, user_id: int, note: str) -> None:
+        try:
+            await self.converse(user_id, [{"type": "text", "text": note}], proactive=True)
         except Exception:
             log.exception("proactive message to %s failed", user_id)
 
-    async def run_forever(self, bot: Bot) -> None:
+    async def run_forever(self) -> None:
         while True:
             try:
-                await self.tick(bot)
+                await self.tick()
             except Exception:
                 log.exception("scheduler tick failed")
             await asyncio.sleep(TICK)
 
-    async def tick(self, bot: Bot) -> None:
+    async def tick(self) -> None:
         now = int(time.time())
         for pid, user_id, reason in await self.storage.due_plans(now):
             await self.storage.finish_plan(pid)
             user = await self.storage.user(user_id)
             if user.blocked or not self.has_access(user) or await self.over_limit(user):
                 continue
-            await self.write_first(bot, user_id, f"[Service note: time to write to the person yourself. Reason: {reason}]")
+            await self.write_first(user_id, f"[Service note: time to write to the person yourself. Reason: {reason}]")
 
         if not self.cfg.checkins:
             return
@@ -170,7 +200,6 @@ class Companion:
             await self.storage.update(user.user_id, unanswered=user.unanswered + 1)
             hours = (now - user.last_user_at) // 3600
             await self.write_first(
-                bot,
                 user.user_id,
                 f"[Service note: the person hasn't written for about {hours} h. Write first — briefly and "
                 "warmly, without reproach and without asking why they disappeared. You can recall something "
@@ -194,13 +223,3 @@ def bubbles(text: str) -> list[str]:
         out.append(part)
     return out
 
-
-async def _keep_typing(bot: Bot, chat_id: int) -> None:
-    try:
-        while True:
-            await bot.send_chat_action(chat_id, ChatAction.TYPING)
-            await asyncio.sleep(4.5)
-    except asyncio.CancelledError:
-        pass
-    except Exception:
-        log.debug("typing indicator failed", exc_info=True)

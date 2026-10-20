@@ -5,8 +5,30 @@ services:
     env_file: .env
     volumes:
       - ./data:/app/data
+    expose:
+      - "8080"  # LINE webhook, reached only through caddy
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "5"
+
+  # HTTPS for webhooks (LINE). Started only with `--profile web`, which the scripts add
+  # when DOMAIN is set in .env; it gets a free Let's Encrypt certificate by itself.
+  caddy:
+    image: caddy:2
+    profiles: ["web"]
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - bot
+
+volumes:
+  caddy_data:

@@ -94,7 +94,8 @@ def setup(cfg: Config, companion: Companion, billing: Billing) -> Router:
         lang = companion.lang(user)
         plan = cfg.plans(companion.tier(user))[days]
         try:
-            url = await billing.start(bot, user.user_id, email, plan)
+            me = await bot.get_me()
+            url = await billing.start(user.user_id, email, plan, return_url=f"https://t.me/{me.username}")
         except YooKassaError as e:
             log.error("YooKassa payment for %s failed: %s", user.user_id, e)
             await message.answer(t(lang, "pay_failed"))
@@ -119,7 +120,7 @@ def setup(cfg: Config, companion: Companion, billing: Billing) -> Router:
             return
         await message.answer(t(lang, "intro", name=companion.name(user), free=cfg.free_messages))
         await companion.write_first(
-            bot, user.user_id,
+            user.user_id,
             "[Service note: this is the very start of your acquaintance — the person has just started the "
             "bot. Say hello, briefly introduce yourself in your own way and ask how to address them.]",
         )
@@ -209,7 +210,7 @@ def setup(cfg: Config, companion: Companion, billing: Billing) -> Router:
     async def on_yk_check(cb: CallbackQuery, bot: Bot) -> None:
         _, lang = await load(cb.from_user)
         try:
-            paid = await billing.check_user(bot, cb.from_user.id)
+            paid = await billing.check_user(cb.from_user.id)
         except YooKassaError as e:
             log.warning("payment check for %s failed: %s", cb.from_user.id, e)
             paid = False
@@ -333,14 +334,13 @@ def setup(cfg: Config, companion: Companion, billing: Billing) -> Router:
                 await send_payment_link(message, bot, user, text, user.awaiting_email)
                 return
             # Not an email: they changed their mind, so treat it as a normal message.
-        if not companion.has_access(user):
-            await show_plans(message, bot, message.from_user, "paywall")
-            return
-        limit = await companion.over_limit(user)
-        if limit:
-            kind, resets = limit
-            await message.answer(t(lang, "limit_day") if kind == "day"
-                                 else t(lang, "limit_period", date=f"{resets:%d.%m}"))
+        blocked = await companion.admit(user)
+        if blocked:
+            key, fields = blocked
+            if key == "paywall":
+                await show_plans(message, bot, message.from_user, "paywall")
+            else:
+                await message.answer(t(lang, key, **fields))
             return
         try:
             content = await _content(message, bot)
@@ -349,7 +349,7 @@ def setup(cfg: Config, companion: Companion, billing: Billing) -> Router:
             return
         await storage.user_wrote(uid, int(time.time()), counted=not companion.subscribed(user))
         try:
-            await companion.converse(bot, uid, content)
+            await companion.converse(uid, content)
         except anthropic.RateLimitError:
             await message.answer(t(lang, "busy"))
         except anthropic.APIError:
