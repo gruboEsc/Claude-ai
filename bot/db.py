@@ -20,7 +20,11 @@ CREATE TABLE IF NOT EXISTS users (
     input_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
     cached_tokens INTEGER NOT NULL DEFAULT 0,
-    created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER))
+    created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER)),
+    email TEXT,                                -- for YooKassa receipts
+    pay_method_id TEXT,                        -- saved YooKassa method for renewals
+    autopay INTEGER NOT NULL DEFAULT 0,
+    awaiting_email INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS dialog (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,7 +53,30 @@ CREATE TABLE IF NOT EXISTS payments (
     recurring INTEGER NOT NULL,
     paid_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER))
 );
+CREATE TABLE IF NOT EXISTS yk_payments (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    amount TEXT NOT NULL,
+    status TEXT NOT NULL,
+    renewal INTEGER NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER))
+);
+CREATE INDEX IF NOT EXISTS yk_pending ON yk_payments(status);
+CREATE TABLE IF NOT EXISTS spend (
+    user_id INTEGER NOT NULL,
+    day TEXT NOT NULL,                         -- person's local date, YYYY-MM-DD
+    usd REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, day)
+);
 """
+
+# Columns added after the first release, appended to existing databases in this order.
+USER_MIGRATIONS = [
+    ("email", "TEXT"),
+    ("pay_method_id", "TEXT"),
+    ("autopay", "INTEGER NOT NULL DEFAULT 0"),
+    ("awaiting_email", "INTEGER NOT NULL DEFAULT 0"),
+]
 
 MAX_NOTES = 150
 
@@ -71,6 +98,10 @@ class User:
     output_tokens: int
     cached_tokens: int
     created_at: int
+    email: str | None
+    pay_method_id: str | None
+    autopay: int
+    awaiting_email: int
 
 
 class Storage:
@@ -83,6 +114,10 @@ class Storage:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
         self.conn = await aiosqlite.connect(self.path)
         await self.conn.executescript(SCHEMA)
+        have = {row[1] for row in await self._all("PRAGMA table_info(users)")}
+        for col, decl in USER_MIGRATIONS:
+            if col not in have:
+                await self.conn.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
         await self.conn.commit()
 
     async def close(self) -> None:
@@ -206,6 +241,60 @@ class Storage:
         )
         return cur.rowcount > 0
 
+    async def extend(self, user_id: int, seconds: int, now: int) -> int:
+        """Add paid time on top of whatever is left; returns the new paid_until."""
+        user = await self.user(user_id)
+        until = max(user.paid_until, now) + seconds
+        await self.update(user_id, paid_until=until)
+        return until
+
+    # YooKassa
+
+    async def add_yk_payment(self, pid: str, user_id: int, amount: str, status: str, renewal: bool) -> None:
+        await self._exec(
+            "INSERT OR IGNORE INTO yk_payments (id, user_id, amount, status, renewal) VALUES (?, ?, ?, ?, ?)",
+            (pid, user_id, amount, status, int(renewal)),
+        )
+
+    async def pending_yk(self, user_id: int | None = None) -> list[tuple[str, int, int, int]]:
+        sql = "SELECT id, user_id, renewal, created_at FROM yk_payments WHERE status IN ('pending', 'waiting_for_capture')"
+        if user_id is None:
+            return await self._all(sql)
+        return await self._all(sql + " AND user_id = ?", (user_id,))
+
+    async def settle_yk(self, pid: str, status: str) -> bool:
+        """Move a pending payment to its final status; False if it was already settled."""
+        cur = await self._exec(
+            "UPDATE yk_payments SET status = ? WHERE id = ? AND status IN ('pending', 'waiting_for_capture')",
+            (status, pid),
+        )
+        return cur.rowcount > 0
+
+    async def renewal_candidates(self, now: int, ahead: int) -> list[User]:
+        cur = await self.conn.execute(
+            "SELECT * FROM users WHERE autopay = 1 AND pay_method_id IS NOT NULL "
+            "AND paid_until < ? AND paid_until > ? AND NOT EXISTS ("
+            "  SELECT 1 FROM yk_payments p WHERE p.user_id = users.user_id AND p.renewal = 1 "
+            "  AND (p.status IN ('pending', 'waiting_for_capture') OR p.created_at > ?))",
+            (now + ahead, now - 3 * 86400, now - 86400),
+        )
+        return [User(*row) for row in await cur.fetchall()]
+
+    # spend limits
+
+    async def add_spend(self, user_id: int, day: str, usd: float) -> None:
+        await self._exec(
+            "INSERT INTO spend (user_id, day, usd) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id, day) DO UPDATE SET usd = usd + excluded.usd",
+            (user_id, day, usd),
+        )
+
+    async def spent(self, user_id: int, since_day: str) -> float:
+        (usd,), = await self._all(
+            "SELECT COALESCE(SUM(usd), 0) FROM spend WHERE user_id = ? AND day >= ?", (user_id, since_day)
+        )
+        return usd
+
     async def admin_stats(self, now: int) -> dict:
         (users,), = await self._all("SELECT COUNT(*) FROM users")
         (active,), = await self._all("SELECT COUNT(*) FROM users WHERE last_user_at > ?", (now - 7 * 86400,))
@@ -218,5 +307,9 @@ class Storage:
             "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), "
             "COALESCE(SUM(cached_tokens),0) FROM users"
         )
-        return dict(users=users, active=active, subs=subs, stars=stars, month=month,
+        (rub_month,), = await self._all(
+            "SELECT COALESCE(SUM(CAST(amount AS REAL)), 0) FROM yk_payments "
+            "WHERE status = 'succeeded' AND created_at > ?", (now - 30 * 86400,)
+        )
+        return dict(users=users, active=active, subs=subs, stars=stars, month=month, rub_month=rub_month,
                     inp=inp, out=out, cached=cached)

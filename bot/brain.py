@@ -3,13 +3,14 @@ import logging
 import re
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiogram import Bot
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramForbiddenError
 
-from .claude import Claude
+from .billing import SUB_PERIOD
+from .claude import Claude, usd
 from .companion import build_system, stamp
 from .config import Config
 from .db import Storage, User
@@ -39,6 +40,25 @@ class Companion:
 
     def subscribed(self, user: User) -> bool:
         return user.user_id in self.cfg.admin_ids or user.paid_until > time.time()
+
+    async def over_limit(self, user: User) -> tuple[str, datetime] | None:
+        """('day' | 'month', when it resets) once a subscriber has used up their API budget."""
+        now = time.time()
+        if user.user_id in self.cfg.admin_ids or user.paid_until <= now:
+            return None  # admins are unlimited; the trial is limited by message count instead
+        tz = await self.tools.tz(user.user_id)
+        today = datetime.now(tz)
+        if await self.storage.spent(user.user_id, today.date().isoformat()) >= self.cfg.daily_limit_usd:
+            tomorrow = (today + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            return "day", tomorrow
+        # The current paid month; when several months are paid ahead, the last 30 days.
+        start = user.paid_until - SUB_PERIOD
+        if start > now:
+            start = now - SUB_PERIOD
+        start_day = datetime.fromtimestamp(start, tz)
+        if await self.storage.spent(user.user_id, start_day.date().isoformat()) >= self.cfg.monthly_limit_usd:
+            return "month", start_day + timedelta(seconds=SUB_PERIOD)
+        return None
 
     async def _system(self, user: User, refresh: bool = False) -> str:
         # Frozen per dialog so every request shares one cached prefix; rebuilt with the
@@ -71,6 +91,10 @@ class Companion:
                 typing.cancel()
 
             await self.storage.add_usage(user_id, reply.input_tokens, reply.output_tokens, reply.cached_tokens)
+            await self.storage.add_spend(
+                user_id, now.date().isoformat(),
+                usd(self.cfg.model, reply.input_tokens, reply.output_tokens, reply.cached_tokens),
+            )
             if reply.refused:
                 # Not saved, so the dialog continues as if this turn never happened.
                 if proactive:
@@ -118,7 +142,7 @@ class Companion:
         for pid, user_id, reason in await self.storage.due_plans(now):
             await self.storage.finish_plan(pid)
             user = await self.storage.user(user_id)
-            if user.blocked or not self.has_access(user):
+            if user.blocked or not self.has_access(user) or await self.over_limit(user):
                 continue
             await self.write_first(bot, user_id, f"[Служебно: пора написать человеку самому. Повод: {reason}]")
 
@@ -127,7 +151,7 @@ class Companion:
         idle = self.cfg.checkin_after_hours * 3600
         for user in await self.storage.checkin_candidates(now, idle):
             hour = datetime.now(await self.tools.tz(user.user_id)).hour
-            if not self.cfg.checkin_from_hour <= hour < self.cfg.checkin_to_hour:
+            if not self.cfg.checkin_from_hour <= hour < self.cfg.checkin_to_hour or await self.over_limit(user):
                 continue
             await self.storage.update(user.user_id, unanswered=user.unanswered + 1)
             hours = (now - user.last_user_at) // 3600

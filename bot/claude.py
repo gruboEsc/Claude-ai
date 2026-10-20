@@ -46,6 +46,11 @@ def cost(model: str, inp: int, out: int, cached: int) -> float | None:
     return (inp * p_in + out * p_out + cached * p_cache) / 1_000_000
 
 
+def usd(model: str, inp: int, out: int, cached: int) -> float:
+    """Like cost(), but prices an unknown model as Opus so spend limits still apply."""
+    return cost(model, inp, out, cached) or cost("claude-opus-5-5", inp, out, cached)
+
+
 async def _ignore(_: str) -> None:
     pass
 

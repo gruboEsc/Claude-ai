@@ -34,6 +34,15 @@ class Config:
     free_messages: int = 30
     price_stars: int = 499  # per 30 days; Telegram subscriptions are always monthly
     support: str = ""
+    # YooKassa (card / SBP / SberPay); disabled while shop id or secret is empty
+    yk_shop_id: str = ""
+    yk_secret: str = ""
+    price_rub: int = 490
+    vat_code: int = 1  # 54-FZ VAT code for receipts; 1 = without VAT
+    yk_autopay: bool = False  # needs autopayments enabled for the shop by YooKassa
+    # API spend cap per subscriber, so one person can't eat the whole budget
+    daily_limit_usd: float = 0.40
+    monthly_limit_usd: float = 4.00
     # The companion writing first
     checkins: bool = True
     checkin_after_hours: int = 20
@@ -68,6 +77,13 @@ class Config:
             free_messages=int(os.getenv("FREE_MESSAGES", "30")),
             price_stars=int(os.getenv("PRICE_STARS", "499")),
             support=os.getenv("SUPPORT_CONTACT", ""),
+            yk_shop_id=os.getenv("YOOKASSA_SHOP_ID", ""),
+            yk_secret=os.getenv("YOOKASSA_SECRET_KEY", ""),
+            price_rub=int(os.getenv("PRICE_RUB", "490")),
+            vat_code=int(os.getenv("YOOKASSA_VAT_CODE", "1")),
+            yk_autopay=_flag("YOOKASSA_AUTOPAY", "0"),
+            daily_limit_usd=float(os.getenv("DAILY_LIMIT_USD", "0.40")),
+            monthly_limit_usd=float(os.getenv("MONTHLY_LIMIT_USD", "4.00")),
             checkins=_flag("CHECKINS", "1"),
             checkin_after_hours=int(os.getenv("CHECKIN_AFTER_HOURS", "20")),
             checkin_from_hour=int(os.getenv("CHECKIN_FROM_HOUR", "10")),
