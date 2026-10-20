@@ -25,6 +25,7 @@ class Config:
     companion_name: str = "Аня"
     companion_gender: str = "f"  # f | m
     max_tokens: int = 16000
+    compact_at: int = 50000  # summarize the dialog once a request reaches this many input tokens (min 50k)
     web_search: bool = True
     admin_ids: frozenset[int] = field(default_factory=frozenset)
     allowed_users: frozenset[int] = field(default_factory=frozenset)  # empty = open to everyone
@@ -71,6 +72,7 @@ class Config:
             companion_name=os.getenv("COMPANION_NAME", "Аня"),
             companion_gender=gender,
             max_tokens=int(os.getenv("MAX_TOKENS", "16000")),
+            compact_at=max(int(os.getenv("COMPACT_AT_TOKENS", "50000")), 50000),
             web_search=_flag("WEB_SEARCH", "1"),
             admin_ids=_ids(os.getenv("ADMIN_IDS", "")),
             allowed_users=_ids(os.getenv("ALLOWED_USERS", "")),

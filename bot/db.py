@@ -181,7 +181,25 @@ class Storage:
     # cache warm and replayed thinking blocks valid.
 
     async def history(self, user_id: int) -> list[dict]:
-        rows = await self._all("SELECT role, content FROM dialog WHERE user_id = ? ORDER BY id", (user_id,))
+        """The dialog from the user turn before the latest compaction block on.
+
+        The API ignores everything before a compaction block, so older turns stay in
+        the database (for /forget and debugging) but are not sent: that keeps requests
+        small even after months of photos.
+        """
+        (compacted,), = await self._all(
+            "SELECT MAX(id) FROM dialog WHERE user_id = ? AND role = 'assistant' AND content LIKE ?",
+            (user_id, '%"type": "compaction"%'),
+        )
+        start = 0
+        if compacted:
+            (start,), = await self._all(
+                "SELECT COALESCE(MAX(id), 0) FROM dialog WHERE user_id = ? AND role = 'user' AND id < ?",
+                (user_id, compacted),
+            )
+        rows = await self._all(
+            "SELECT role, content FROM dialog WHERE user_id = ? AND id >= ? ORDER BY id", (user_id, start)
+        )
         return [{"role": role, "content": json.loads(content)} for role, content in rows]
 
     async def append(self, user_id: int, turns: list[dict]) -> None:

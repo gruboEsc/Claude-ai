@@ -231,9 +231,52 @@ def test_claude_tool_loop_and_compaction_flag():
     reply = run(claude.reply("sys", [{"role": "user", "content": "hi"}], "low", run_tool))
     assert reply.text == "Ага!" and reply.compacted
     assert [t["role"] for t in reply.turns] == ["assistant", "user", "assistant"]
-    assert sent[0]["context_management"] == {"edits": [{"type": "compact_20260112", "instructions": "keep facts"}]}
+    assert sent[0]["context_management"] == {"edits": [{
+        "type": "compact_20260112",
+        "trigger": {"type": "input_tokens", "value": 50000},
+        "instructions": "keep facts",
+    }]}
     assert sent[1]["messages"][: len(sent[0]["messages"])] == sent[0]["messages"]
 
 
 def test_cost():
     assert cost("claude-opus-5-5", 1_000_000, 1_000_000, 1_000_000) == pytest.approx(24.2)
+
+
+def test_compaction_steps_are_billed():
+    step = lambda i, o: SimpleNamespace(input_tokens=i, output_tokens=o, cache_creation_input_tokens=0,
+                                        cache_read_input_tokens=0)
+    message = _message("end_turn", Block(type="text", text="ok"))
+    message.usage.iterations = [step(40000, 2000), step(3000, 100)]  # compaction + the reply
+
+    def stream(**kwargs):
+        return FakeStream(message)
+
+    claude = Claude(CFG, TOOLS)
+    claude.client = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(stream=stream)))
+
+    async def run_tool(name, args):
+        return "ok"
+
+    reply = run(claude.reply("sys", [{"role": "user", "content": "hi"}], "low", run_tool))
+    assert (reply.input_tokens, reply.output_tokens) == (43000, 2100)
+
+
+def test_history_starts_at_latest_compaction(tmp_path):
+    async def scenario():
+        storage = Storage(str(tmp_path / "bot.db"))
+        await storage.open()
+        turn = lambda role, text: {"role": role, "content": [{"type": "text", "text": text}]}
+        await storage.append(1, [turn("user", "old q"), turn("assistant", "old a")])
+        assert len(await storage.history(1)) == 2
+        compacted = {"role": "assistant", "content": [{"type": "compaction", "content": "сводка"},
+                                                      {"type": "text", "text": "a2"}]}
+        await storage.append(1, [turn("user", "q2"), compacted, turn("user", "q3")])
+        history = await storage.history(1)
+        assert [t["content"][-1]["text"] for t in history] == ["q2", "a2", "q3"]
+        assert history[0]["role"] == "user"
+        await storage.append(2, [turn("user", "other")])  # other people are unaffected
+        assert len(await storage.history(2)) == 1
+        await storage.close()
+
+    run(scenario())

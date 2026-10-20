@@ -64,7 +64,9 @@ class Claude:
         self.tools = list(tools)
         if cfg.web_search:
             self.tools.append({"type": "web_search_20260209", "name": "web_search", "max_uses": 3})
-        compact = {"type": "compact_20260112"}
+        # Compacting early keeps every request small (and cheap); long-term facts live
+        # in the memory notes, which are put back into the system prompt after each compaction.
+        compact = {"type": "compact_20260112", "trigger": {"type": "input_tokens", "value": cfg.compact_at}}
         if compaction_instructions:
             compact["instructions"] = compaction_instructions
         self.context_management = {"edits": [compact]}
@@ -102,10 +104,13 @@ class Claude:
                     await on_text(result.text)
                 message = await stream.get_final_message()
 
+            # Top-level usage leaves out extra sampling steps (a compaction summary, a
+            # fallback model); when the per-step breakdown is present, bill from it.
             usage = message.usage
-            result.input_tokens += usage.input_tokens + (usage.cache_creation_input_tokens or 0)
-            result.cached_tokens += usage.cache_read_input_tokens or 0
-            result.output_tokens += usage.output_tokens
+            for step in getattr(usage, "iterations", None) or [usage]:
+                result.input_tokens += step.input_tokens + (step.cache_creation_input_tokens or 0)
+                result.cached_tokens += step.cache_read_input_tokens or 0
+                result.output_tokens += step.output_tokens
 
             if message.stop_reason == "refusal":
                 result.refused = True

@@ -41,7 +41,10 @@ PROMPT = """\
 Ты запоминаешь важное о человеке инструментом remember: имя и как к нему обращаться, \
 близких людей и питомцев, работу, увлечения, предстоящие события с датами, что его \
 радует и ранит, что помогает, когда ему плохо, каких тем лучше не касаться. Запоминай \
-тихо, не объявляй об этом. Устаревшее исправляй (update_note) или удаляй (delete_note).
+тихо, не объявляй об этом, и не скупись: старая переписка со временем сворачивается в \
+краткую сводку, и надёжно сохраняется только то, что ты записал. Устаревшее исправляй \
+(update_note) или удаляй (delete_note). Если не помнишь деталь точно — не выдумывай, \
+мягко уточни у человека.
 Если человек упоминает событие в будущем (экзамен, врач, свидание, трудный разговор), \
 можешь запланировать написать ему сам (schedule_message): пожелать удачи или спросить, как \
 прошло. Так же ставь напоминания, если он о них просит. Узнал, в каком городе или часовом \
@@ -87,14 +90,27 @@ def build_system(name: str, gender: str, notes: list[tuple[int, str]], tz: str) 
     return system
 
 
-COMPACTION_INSTRUCTIONS = (
-    "Summarize this companionship chat so it can continue seamlessly. Keep, in Russian: every "
-    "fact about the person (name, how they like to be addressed, people and pets in their life, "
-    "work, interests, health, upcoming events with dates), their emotional state and what has "
-    "been happening in their life recently, what kind of support and tone works for them, topics "
-    "to avoid, running jokes and nicknames, promises made in either direction, and the last few "
-    "messages verbatim."
-)
+COMPACTION_INSTRUCTIONS = """\
+You are the companion in the chat above. Its raw history is about to be replaced by the \
+summary you write now, so after this you will remember only what the summary says (plus \
+your memory notes). Losing a detail the person told you would hurt them, so err on the side \
+of keeping too much. Write the summary in Russian, as notes to yourself, with these sections:
+
+1. Who the person is: name and how they like to be addressed, «ты»/«вы», age, city, work or \
+study, family, friends, partner, pets — with names. Health and anything sensitive they shared.
+2. Their life story so far as told in the chat, in chronological order with dates: what \
+happened, how they felt about it, how it turned out.
+3. Right now: their current mood and situation, what is worrying or pleasing them, open \
+threads — upcoming events with dates, things you promised to ask about, things they promised \
+to tell you, unanswered questions.
+4. How to be with them: what kind of support works and what doesn't, tone and humour that \
+land, their texting style, topics to avoid, whether there is light flirting between you.
+5. Your shared history: inside jokes, nicknames, recurring topics, favourite things you talked \
+about, memorable moments.
+6. The last 10 messages word for word, each marked with who wrote it.
+
+Include previous summaries' content too — nothing from earlier summaries may be dropped \
+unless it is clearly outdated. Wrap the whole summary in <summary></summary>."""
 
 
 def stamp(now: datetime) -> str:
