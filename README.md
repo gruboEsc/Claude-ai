@@ -74,12 +74,33 @@ pip install -r requirements.txt
 python -m bot
 ```
 
-### Docker
+### На сервере (работает круглосуточно)
+
+Нужен VPS с Ubuntu **за пределами России** (Нидерланды, Германия, Финляндия): Claude API не
+обслуживает российские IP. Хватит самого дешёвого тарифа (1 CPU, 1 ГБ RAM).
 
 ```bash
-docker build -t companion-bot .
-docker run -d --restart=always --env-file .env -v $(pwd)/data:/app/data companion-bot
+ssh root@IP_СЕРВЕРА
+apt-get update && apt-get install -y git
+git clone -b claude/telegram-bot-wyp72j https://github.com/gruboEsc/Claude-ai.git companion-bot
+cd companion-bot
+bash scripts/setup_server.sh   # первый раз создаст .env и попросит его заполнить
+nano .env                      # вписать токены, сохранить: Ctrl+O, Enter, Ctrl+X
+bash scripts/setup_server.sh   # ставит Docker, запускает бота, включает бэкапы
 ```
+
+После этого бот работает сам и перезапускается после сбоев и перезагрузок сервера.
+
+| Что | Команда |
+|---|---|
+| Логи | `docker compose logs -f` |
+| Обновить до свежего кода | `bash scripts/update.sh` |
+| Перезапустить (после правки `.env`) | `docker compose up -d` |
+| Остановить | `docker compose down` |
+| Бэкап базы сейчас | `bash scripts/backup.sh` |
+
+Бэкап базы делается каждый день в 04:00 в папку `backups/` и хранится 14 дней. Время от
+времени скачивай свежий бэкап к себе: `scp root@IP_СЕРВЕРА:companion-bot/backups/*.gz .`
 
 Все настройки описаны в `.env.example`: имя и пол собеседника (`COMPANION_NAME`,
 `COMPANION_GENDER`), цена, длина пробного периода, когда писать первым, модель и глубина
