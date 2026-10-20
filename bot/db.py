@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS users (
     pay_method_id TEXT,                        -- saved YooKassa method for renewals
     autopay INTEGER NOT NULL DEFAULT 0,
     awaiting_email INTEGER NOT NULL DEFAULT 0,   -- plan days to pay for once the email arrives
-    plan_days INTEGER NOT NULL DEFAULT 30        -- length of the plan last paid for
+    plan_days INTEGER NOT NULL DEFAULT 30,       -- length of the plan last paid for
+    lang TEXT                                    -- interface and companion language (i18n.LANGS)
 );
 CREATE TABLE IF NOT EXISTS dialog (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,6 +82,7 @@ MIGRATIONS = {
         ("autopay", "INTEGER NOT NULL DEFAULT 0"),
         ("awaiting_email", "INTEGER NOT NULL DEFAULT 0"),
         ("plan_days", "INTEGER NOT NULL DEFAULT 30"),
+        ("lang", "TEXT"),
     ],
     "yk_payments": [("days", "INTEGER NOT NULL DEFAULT 30")],
 }
@@ -110,6 +112,7 @@ class User:
     autopay: int
     awaiting_email: int
     plan_days: int
+    lang: str | None
 
 
 class Storage:
@@ -127,6 +130,9 @@ class Storage:
             for col, decl in columns:
                 if col not in have:
                     await self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+                    if (table, col) == ("users", "lang"):
+                        # Everyone from before languages existed used the Russian-only bot.
+                        await self.conn.execute("UPDATE users SET lang = 'ru'")
         await self.conn.commit()
 
     async def close(self) -> None:
@@ -342,5 +348,8 @@ class Storage:
             "SELECT COALESCE(SUM(CAST(amount AS REAL)), 0) FROM yk_payments "
             "WHERE status = 'succeeded' AND created_at > ?", (now - 30 * 86400,)
         )
+        langs = await self._all(
+            "SELECT COALESCE(lang, '?'), COUNT(*) FROM users GROUP BY 1 ORDER BY 2 DESC LIMIT 12"
+        )
         return dict(users=users, active=active, subs=subs, stars=stars, month=month, rub_month=rub_month,
-                    inp=inp, out=out, cached=cached)
+                    inp=inp, out=out, cached=cached, langs=langs)

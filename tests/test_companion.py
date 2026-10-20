@@ -104,7 +104,7 @@ def test_checkin_only_for_idle_subscribers_and_capped(tmp_path):
         await companion.tick(bot)
         assert [uid for uid, _ in bot.sent] == [1, 1]
         note = companion.claude.calls[0][1][-1]["content"][1]["text"]
-        assert note.startswith("[Служебно") and "30 ч" in note
+        assert note.startswith("[Service note") and "30 h" in note
         # just wrote, so no second check-in right away
         bot.sent.clear()
         await companion.tick(bot)
@@ -167,10 +167,12 @@ def test_bubbles():
 
 
 def test_system_prompt():
-    system = build_system("Аня", "f", [(3, "зовут Петя")], "Europe/Moscow")
-    assert "Аня" in system and "#3: зовут Петя" in system and "8-800-2000-122" in system
-    assert "только знакомитесь" in build_system("Макс", "m", [], "Europe/Moscow")
-    assert stamp(datetime(2026, 10, 20, 15, 40)) == "[20.10.2026, вторник, 15:40]"
+    system = build_system("Аня", "f", "ru", [(3, "зовут Петя")], "Europe/Moscow")
+    assert "You are Аня" in system and "#3: зовут Петя" in system and "Write in Russian" in system
+    assert "8-800-2000-122" in system and "109" in system and "findahelpline.com" in system
+    ja = build_system("レン", "m", "ja", [], "Asia/Tokyo")
+    assert "Write in Japanese" in ja and "です/ます" in ja and "getting to know each other" in ja
+    assert stamp(datetime(2026, 10, 20, 15, 40)) == "[2026-10-20, Tuesday, 15:40]"
 
 
 def test_tool_definitions_are_valid():

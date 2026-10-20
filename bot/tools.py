@@ -29,7 +29,7 @@ TOOLS = [
         "Save a lasting fact about the person to your long-term memory (survives across dialogs): "
         "their name and how to address them, people and pets in their life, work, interests, "
         "upcoming events with dates, what makes them happy or hurts, what helps when they feel "
-        "bad, topics to avoid. One fact per call, in Russian, written as a note to yourself.",
+        "bad, topics to avoid. One fact per call, in the language you speak with the person, written as a note to yourself.",
         {"fact": TEXT},
         ["fact"],
     ),

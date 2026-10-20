@@ -16,12 +16,15 @@ from aiogram.types import (
     LabeledPrice,
     Message,
     PreCheckoutQuery,
+    User as TgUser,
 )
 
 from .billing import Billing
 from .brain import Companion
 from .claude import cost
 from .config import Config
+from .db import User
+from .i18n import LANGS, lang_of, t
 from .yookassa import YooKassaError
 
 log = logging.getLogger(__name__)
@@ -32,235 +35,245 @@ IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
+class UserFacingError(Exception):
+    """Carries an i18n key for a message to show the person."""
+
+
 def setup(cfg: Config, companion: Companion, billing: Billing) -> Router:
     router = Router()
     router.message.filter(F.chat.type == ChatType.PRIVATE)
     storage = companion.storage
-    name = cfg.companion_name
 
     def allowed(user_id: int) -> bool:
         return not cfg.allowed_users or user_id in cfg.allowed_users or user_id in cfg.admin_ids
 
-    plans = cfg.plans()
+    async def load(tg: TgUser) -> tuple[User, str]:
+        """The stored user and their language, picked from Telegram on first contact."""
+        user = await storage.user(tg.id)
+        if not user.lang:
+            await storage.update(tg.id, lang=lang_of(tg.language_code))
+            user = await storage.user(tg.id)
+        return user, companion.lang(user)
 
-    def prices() -> str:
+    def rubles(lang: str) -> bool:
+        return billing.enabled and lang == "ru"  # YooKassa takes Russian cards only
+
+    def prices(user: User, lang: str) -> str:
+        key = "price_line_rub" if rubles(lang) else "price_line"
         return "; ".join(
-            f"{p.title.lower()} — {p.rub} ₽ или {p.stars} ⭐" if billing.enabled else f"{p.title.lower()} — {p.stars} ⭐"
-            for p in plans.values()
+            t(lang, key, title=t(lang, f"plan_{d}").lower(), rub=p.rub, stars=p.stars)
+            for d, p in cfg.plans(companion.tier(user)).items()
         )
 
-    async def paywall(message: Message) -> None:
-        await message.answer(
-            f"Бесплатные сообщения закончились.\n\n"
-            f"Чтобы продолжить общение с {name}, выбери подписку: {prices()}.",
-            reply_markup=await _subscribe_kb(message.bot),
-        )
-
-    async def _stars_link(bot: Bot, days: int) -> str:
-        plan = plans[days]
+    async def stars_link(bot: Bot, user: User, lang: str, days: int) -> str:
+        plan = cfg.plans(companion.tier(user))[days]
         monthly = days == 30  # Telegram only has 30-day Stars subscriptions
         return await bot.create_invoice_link(
-            title=f"{name}: {plan.title.lower()}",
-            description=f"Общение на {days} дней, сообщения первым и напоминания."
-                        + (" Продлевается автоматически." if monthly else ""),
+            title=f"{companion.name(user)}: {t(lang, f'plan_{days}')}",
+            description=t(lang, "invoice_desc", days=days) + (t(lang, "invoice_renews") if monthly else ""),
             payload=f"plan{days}",
             currency="XTR",
-            prices=[LabeledPrice(label=f"{days} дней", amount=plan.stars)],
+            prices=[LabeledPrice(label=t(lang, f"plan_{days}"), amount=plan.stars)],
             subscription_period=SUB_PERIOD if monthly else None,
         )
 
-    async def _subscribe_kb(bot: Bot) -> InlineKeyboardMarkup:
+    async def plans_kb(bot: Bot, user: User, lang: str) -> InlineKeyboardMarkup:
         rows = []
-        for days, plan in plans.items():
+        for days, plan in cfg.plans(companion.tier(user)).items():
+            title = t(lang, f"plan_{days}")
             row = []
-            if billing.enabled:
-                row.append(InlineKeyboardButton(text=f"💳 {plan.title} — {plan.rub} ₽", callback_data=f"yk:pay:{days}"))
-            row.append(InlineKeyboardButton(text=f"⭐ {plan.title} — {plan.stars}", url=await _stars_link(bot, days)))
+            if rubles(lang):
+                row.append(InlineKeyboardButton(text=t(lang, "btn_card", title=title, rub=plan.rub),
+                                                callback_data=f"yk:pay:{days}"))
+            row.append(InlineKeyboardButton(text=t(lang, "btn_stars", title=title, stars=plan.stars),
+                                            url=await stars_link(bot, user, lang, days)))
             rows.append(row)
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    async def send_payment_link(message: Message, bot: Bot, user_id: int, email: str, days: int) -> None:
-        plan = plans[days]
+    async def send_payment_link(message: Message, bot: Bot, user: User, email: str, days: int) -> None:
+        lang = companion.lang(user)
+        plan = cfg.plans(companion.tier(user))[days]
         try:
-            url = await billing.start(bot, user_id, email, plan)
+            url = await billing.start(bot, user.user_id, email, plan)
         except YooKassaError as e:
-            log.error("YooKassa payment for %s failed: %s", user_id, e)
-            await message.answer("Не получилось создать платёж 😔 Попробуй чуть позже или оплати звёздами.")
+            log.error("YooKassa payment for %s failed: %s", user.user_id, e)
+            await message.answer(t(lang, "pay_failed"))
             return
-        consent = (f" Оплачивая, ты соглашаешься на автопродление: каждые {days} дней с карты будет списываться "
-                   f"{plan.rub} ₽. Отключить можно в /status." if cfg.yk_autopay else "")
+        consent = t(lang, "pay_consent", days=days, rub=plan.rub) if cfg.yk_autopay else ""
         await message.answer(
-            f"Подписка на {days} дней — {plan.rub} ₽. Чек придёт на {email}.{consent}\n\n"
-            "После оплаты вернись сюда — я сам замечу платёж в течение минуты, или нажми «Я оплатил».",
+            t(lang, "pay_link", days=days, rub=plan.rub, email=email, consent=consent),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="💳 Перейти к оплате", url=url)],
-                [InlineKeyboardButton(text="✅ Я оплатил", callback_data="yk:check")],
+                [InlineKeyboardButton(text=t(lang, "btn_go_pay"), url=url)],
+                [InlineKeyboardButton(text=t(lang, "btn_paid"), callback_data="yk:check")],
             ]),
         )
 
     @router.message(CommandStart())
     async def cmd_start(message: Message, bot: Bot) -> None:
-        uid = message.from_user.id
-        if not allowed(uid):
-            await message.answer("Бот пока в закрытом режиме.")
+        user, lang = await load(message.from_user)
+        if not allowed(user.user_id):
+            await message.answer(t(lang, "closed"))
             return
-        new = await storage.is_new(uid)
-        user = await storage.user(uid)
-        if not new and user.system:
-            await message.answer("Я тут 🙂 Пиши.")
+        if user.system:
+            await message.answer(t(lang, "back"))
             return
-        await message.answer(
-            f"Привет! Здесь можно просто поговорить — с {name}.\n\n"
-            "Пару честных слов заранее: я ИИ-собеседник. Я запоминаю, что ты рассказываешь, "
-            "чтобы общаться как старый знакомый, и иногда пишу первым — это можно выключить в /settings. "
-            "Стереть всё, что я знаю, — /forget. Я не заменяю врача или психолога.\n\n"
-            f"Первые {cfg.free_messages} сообщений бесплатно."
-        )
+        await message.answer(t(lang, "intro", name=companion.name(user), free=cfg.free_messages))
         await companion.write_first(
-            bot, uid,
-            "[Служебно: это самое начало вашего знакомства, человек только что запустил бота. "
-            "Поздоровайся, коротко представься по-своему и спроси, как к нему обращаться.]",
+            bot, user.user_id,
+            "[Service note: this is the very start of your acquaintance — the person has just started the "
+            "bot. Say hello, briefly introduce yourself in your own way and ask how to address them.]",
         )
+
+    @router.message(Command("language"))
+    async def cmd_language(message: Message) -> None:
+        _, lang = await load(message.from_user)
+        buttons = [InlineKeyboardButton(text=("✅ " if code == lang else "") + info.native, callback_data=f"lang:{code}")
+                   for code, info in LANGS.items()]
+        await message.answer(t(lang, "language_pick"), reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[buttons[i:i + 2] for i in range(0, len(buttons), 2)]))
+
+    @router.callback_query(F.data.startswith("lang:"))
+    async def on_language(cb: CallbackQuery) -> None:
+        code = cb.data.split(":", 1)[1]
+        if code not in LANGS:
+            await cb.answer()
+            return
+        async with companion.locks[cb.from_user.id]:
+            # A new language means a new companion persona, so the frozen prompt is rebuilt.
+            await storage.update(cb.from_user.id, lang=code, system=None)
+        await cb.message.edit_text(t(code, "language_set"))
+        await cb.answer()
 
     @router.message(Command("status"))
     async def cmd_status(message: Message, bot: Bot) -> None:
-        user = await storage.user(message.from_user.id)
+        user, lang = await load(message.from_user)
         if companion.subscribed(user):
             until = datetime.fromtimestamp(user.paid_until, timezone.utc).astimezone(await companion.tools.tz(user.user_id))
-            text = f"✨ Подписка активна до {until:%d.%m.%Y}."
+            text = t(lang, "status_active", date=f"{until:%d.%m.%Y}")
             if user.autopay:
-                plan = plans.get(user.plan_days, plans[30])
-                text += f"\nАвтопродление с карты включено: {plan.rub} ₽ раз в {plan.days} дней."
+                plan = cfg.plans(companion.tier(user)).get(user.plan_days) or cfg.plans()[30]
+                text += t(lang, "status_autopay", rub=plan.rub, days=plan.days)
             rows = []
             if user.charge_id or user.autopay:
-                rows.append([InlineKeyboardButton(text="Отменить продление", callback_data="unsub")])
+                rows.append([InlineKeyboardButton(text=t(lang, "btn_cancel_renew"), callback_data="unsub")])
             if not user.autopay:
-                rows.append([InlineKeyboardButton(text="Продлить заранее", callback_data="subscribe")])
+                rows.append([InlineKeyboardButton(text=t(lang, "btn_renew_early"), callback_data="subscribe")])
             await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
         else:
-            left = max(cfg.free_messages - user.used, 0)
             await message.answer(
-                f"Бесплатных сообщений осталось: {left} из {cfg.free_messages}.\n"
-                f"Подписка — {prices()}.",
-                reply_markup=await _subscribe_kb(bot),
+                t(lang, "status_trial", left=max(cfg.free_messages - user.used, 0), free=cfg.free_messages,
+                  prices=prices(user, lang)),
+                reply_markup=await plans_kb(bot, user, lang),
             )
+
+    async def show_plans(message: Message, bot: Bot, tg: TgUser, key: str) -> None:
+        user, lang = await load(tg)
+        await message.answer(t(lang, key, name=companion.name(user), prices=prices(user, lang)),
+                             reply_markup=await plans_kb(bot, user, lang))
 
     @router.message(Command("subscribe"))
     async def cmd_subscribe(message: Message, bot: Bot) -> None:
-        await message.answer(
-            f"Подписка: {prices()}. Продление отменяется в /status.",
-            reply_markup=await _subscribe_kb(bot),
-        )
+        await show_plans(message, bot, message.from_user, "subscribe")
 
     @router.callback_query(F.data == "subscribe")
     async def on_subscribe(cb: CallbackQuery, bot: Bot) -> None:
-        await cmd_subscribe(cb.message, bot)
+        await show_plans(cb.message, bot, cb.from_user, "subscribe")
         await cb.answer()
 
     @router.callback_query(F.data == "unsub")
     async def on_unsub(cb: CallbackQuery, bot: Bot) -> None:
-        user = await storage.user(cb.from_user.id)
+        user, lang = await load(cb.from_user)
         if user.charge_id:
             try:
-                await bot.edit_user_star_subscription(cb.from_user.id, user.charge_id, is_canceled=True)
+                await bot.edit_user_star_subscription(user.user_id, user.charge_id, is_canceled=True)
             except TelegramBadRequest as e:
-                log.info("Stars subscription cancel for %s: %s", cb.from_user.id, e)
-        await storage.update(cb.from_user.id, autopay=0, pay_method_id=None, charge_id=None)
-        await cb.message.edit_text("Продление отменено. Подписка будет работать до конца оплаченного срока.")
+                log.info("Stars subscription cancel for %s: %s", user.user_id, e)
+        await storage.update(user.user_id, autopay=0, pay_method_id=None, charge_id=None)
+        await cb.message.edit_text(t(lang, "unsub_done"))
         await cb.answer()
 
     @router.callback_query(F.data.startswith("yk:pay:"))
     async def on_yk_pay(cb: CallbackQuery, bot: Bot) -> None:
         await cb.answer()
+        user, lang = await load(cb.from_user)
         days = int(cb.data.rsplit(":", 1)[1])
-        if days not in plans:
+        if days not in cfg.plans() or not rubles(lang):
             return
-        user = await storage.user(cb.from_user.id)
         if user.email:
-            await send_payment_link(cb.message, bot, user.user_id, user.email, days)
+            await send_payment_link(cb.message, bot, user, user.email, days)
             return
         await storage.update(user.user_id, awaiting_email=days)
-        await cb.message.answer("Пришли, пожалуйста, email — на него придёт чек об оплате (так требует закон).")
+        await cb.message.answer(t(lang, "ask_email"))
 
     @router.callback_query(F.data == "yk:check")
     async def on_yk_check(cb: CallbackQuery, bot: Bot) -> None:
+        _, lang = await load(cb.from_user)
         try:
             paid = await billing.check_user(bot, cb.from_user.id)
         except YooKassaError as e:
             log.warning("payment check for %s failed: %s", cb.from_user.id, e)
             paid = False
         if paid:
-            await cb.answer("Оплата прошла!")
+            await cb.answer(t(lang, "paid_ok"))
             await cb.message.edit_reply_markup(reply_markup=None)
         else:
             user = await storage.user(cb.from_user.id)
-            await cb.answer(
-                "Подписка уже активна 🙂" if companion.subscribed(user)
-                else "Пока не вижу оплату. Если уже оплатил — подожди минутку.",
-                show_alert=True,
-            )
+            await cb.answer(t(lang, "already_active" if companion.subscribed(user) else "not_paid_yet"),
+                            show_alert=True)
 
     @router.message(Command("settings"))
     async def cmd_settings(message: Message) -> None:
-        user = await storage.user(message.from_user.id)
+        user, lang = await load(message.from_user)
         await message.answer(
-            f"{name} иногда пишет первым, если ты долго молчишь (только при подписке, не чаще раза в день, "
-            f"с {cfg.checkin_from_hour}:00 до {cfg.checkin_to_hour}:00).",
-            reply_markup=_checkins_kb(bool(user.checkins)),
+            t(lang, "settings", name=companion.name(user), from_h=cfg.checkin_from_hour, to_h=cfg.checkin_to_hour),
+            reply_markup=_checkins_kb(lang, bool(user.checkins)),
         )
 
     @router.callback_query(F.data.startswith("checkins:"))
     async def on_checkins(cb: CallbackQuery) -> None:
+        _, lang = await load(cb.from_user)
         on = cb.data.endswith(":on")
         await storage.update(cb.from_user.id, checkins=int(on))
-        await cb.message.edit_reply_markup(reply_markup=_checkins_kb(on))
-        await cb.answer("Включено" if on else "Выключено")
+        await cb.message.edit_reply_markup(reply_markup=_checkins_kb(lang, on))
+        await cb.answer(t(lang, "toggled_on" if on else "toggled_off"))
 
     @router.message(Command("forget"))
     async def cmd_forget(message: Message) -> None:
+        _, lang = await load(message.from_user)
         await message.answer(
-            "Стереть всю переписку и всё, что я о тебе запомнил? Это нельзя отменить.",
+            t(lang, "forget_confirm"),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="Да, стереть", callback_data="forget:yes"),
-                InlineKeyboardButton(text="Нет", callback_data="forget:no"),
+                InlineKeyboardButton(text=t(lang, "btn_yes_erase"), callback_data="forget:yes"),
+                InlineKeyboardButton(text=t(lang, "btn_no"), callback_data="forget:no"),
             ]]),
         )
 
     @router.callback_query(F.data.startswith("forget:"))
     async def on_forget(cb: CallbackQuery) -> None:
+        _, lang = await load(cb.from_user)
         if cb.data.endswith(":yes"):
             async with companion.locks[cb.from_user.id]:
                 await storage.forget_everything(cb.from_user.id)
-            await cb.message.edit_text("Готово, всё стёрто. Напиши /start, чтобы познакомиться заново.")
+            await cb.message.edit_text(t(lang, "forgot"))
         else:
-            await cb.message.edit_text("Ничего не трогаю 🙂")
+            await cb.message.edit_text(t(lang, "kept"))
         await cb.answer()
 
     @router.message(Command("paysupport"))
     async def cmd_paysupport(message: Message) -> None:
-        contact = f" Напиши {cfg.support}." if cfg.support else ""
-        await message.answer(
-            "Вопросы по оплате и возвратам: опиши проблему и приложи дату платежа." + contact
-        )
+        _, lang = await load(message.from_user)
+        contact = t(lang, "paysupport_contact", contact=cfg.support) if cfg.support else ""
+        await message.answer(t(lang, "paysupport") + contact)
 
     @router.message(Command("terms"))
     async def cmd_terms(message: Message) -> None:
-        await message.answer(
-            f"{name} — ИИ-собеседник для дружеского общения. Это не медицинская и не психологическая помощь. "
-            "Переписка и заметки хранятся на сервере, чтобы собеседник помнил контекст; стереть их — /forget. "
-            f"Подписка: {prices()}. Месячная через Stars (и через карту, если включено автопродление) "
-            "продлевается автоматически; отмена в /status. "
-            f"В подписке есть разумный лимит общения в день и в месяц — его хватает на долгие ежедневные разговоры. "
-            "В экстренной ситуации звони 112."
-        )
+        user, lang = await load(message.from_user)
+        await message.answer(t(lang, "terms", name=companion.name(user), prices=prices(user, lang)))
 
     @router.message(Command("help"))
     async def cmd_help(message: Message) -> None:
-        await message.answer(
-            f"Просто пиши — {name} ответит. Можно присылать фото.\n\n"
-            "/status — подписка\n/settings — писать ли тебе первым\n"
-            "/forget — стереть всё\n/terms — условия\n/paysupport — помощь с оплатой"
-        )
+        user, lang = await load(message.from_user)
+        await message.answer(t(lang, "help", name=companion.name(user)))
 
     @router.message(Command("admin"))
     async def cmd_admin(message: Message) -> None:
@@ -268,8 +281,10 @@ def setup(cfg: Config, companion: Companion, billing: Billing) -> Router:
             return
         s = await storage.admin_stats(int(time.time()))
         spent = cost(cfg.model, s["inp"], s["out"], s["cached"])
+        langs = ", ".join(f"{code} {n}" for code, n in s["langs"])
         await message.answer(
             f"👥 Пользователей: {s['users']} · активных за 7 дней: {s['active']}\n"
+            f"🌍 Языки: {langs or '—'}\n"
             f"⭐ Подписчиков: {s['subs']} · Stars за 30 дней: {s['month']} · всего: {s['stars']}\n"
             f"💳 ЮKassa за 30 дней: {s['rub_month']:,.0f} ₽\n"
             f"🔢 Токенов: вход {s['inp']:,} · кэш {s['cached']:,} · выход {s['out']:,}\n"
@@ -283,73 +298,71 @@ def setup(cfg: Config, companion: Companion, billing: Billing) -> Router:
     @router.message(F.successful_payment)
     async def on_paid(message: Message) -> None:
         p = message.successful_payment
-        uid = message.from_user.id
-        if not await storage.record_payment(p.telegram_payment_charge_id, uid, p.total_amount, bool(p.is_recurring)):
+        user, lang = await load(message.from_user)
+        if not await storage.record_payment(p.telegram_payment_charge_id, user.user_id, p.total_amount,
+                                            bool(p.is_recurring)):
             return  # duplicate delivery
-        user = await storage.user(uid)
         days = 14 if p.invoice_payload == "plan14" else 30
         if p.subscription_expiration_date:
             # Never shorten time already paid another way (e.g. through YooKassa).
             until = max(int(p.subscription_expiration_date), user.paid_until)
-            await storage.update(uid, paid_until=until, plan_days=days)
+            await storage.update(user.user_id, paid_until=until, plan_days=days)
         else:
-            await storage.extend(uid, days, int(time.time()))
-        await storage.update(uid, charge_id=p.telegram_payment_charge_id)
+            await storage.extend(user.user_id, days, int(time.time()))
+        await storage.update(user.user_id, charge_id=p.telegram_payment_charge_id)
         if not p.is_recurring or p.is_first_recurring:
-            await message.answer("Спасибо! ⭐ Подписка оформлена — теперь можно общаться без ограничений.")
+            await message.answer(t(lang, "thanks_paid"))
 
     @router.message(F.voice | F.video_note | F.audio)
     async def on_voice(message: Message) -> None:
-        await message.answer("Голосовые пока не слушаю 🙈 Напиши, пожалуйста, текстом.")
+        _, lang = await load(message.from_user)
+        await message.answer(t(lang, "voice"))
 
     @router.message(F.text | F.photo | F.sticker | F.document)
     async def on_message(message: Message, bot: Bot) -> None:
-        uid = message.from_user.id
+        user, lang = await load(message.from_user)
+        uid = user.user_id
         if not allowed(uid):
-            await message.answer("Бот пока в закрытом режиме.")
+            await message.answer(t(lang, "closed"))
             return
-        user = await storage.user(uid)
         if user.awaiting_email:
             await storage.update(uid, awaiting_email=0)
             text = (message.text or "").strip()
-            if EMAIL.match(text) and user.awaiting_email in plans:
+            if EMAIL.match(text) and user.awaiting_email in cfg.plans():
                 await storage.update(uid, email=text)
-                await send_payment_link(message, bot, uid, text, user.awaiting_email)
+                await send_payment_link(message, bot, user, text, user.awaiting_email)
                 return
             # Not an email: they changed their mind, so treat it as a normal message.
         if not companion.has_access(user):
-            await paywall(message)
+            await show_plans(message, bot, message.from_user, "paywall")
             return
         limit = await companion.over_limit(user)
         if limit:
             kind, resets = limit
-            await message.answer(
-                "Мы сегодня очень много проговорили 🙂 Дневной лимит общения закончился — "
-                "давай продолжим завтра, я буду ждать." if kind == "day" else
-                f"Лимит общения на этот оплаченный срок закончился. Он обновится {resets:%d.%m}."
-            )
+            await message.answer(t(lang, "limit_day") if kind == "day"
+                                 else t(lang, "limit_period", date=f"{resets:%d.%m}"))
             return
         try:
             content = await _content(message, bot)
-        except ValueError as e:
-            await message.answer(str(e))
+        except UserFacingError as e:
+            await message.answer(t(lang, str(e)))
             return
         await storage.user_wrote(uid, int(time.time()), counted=not companion.subscribed(user))
         try:
             await companion.converse(bot, uid, content)
         except anthropic.RateLimitError:
-            await message.answer("Ой, что-то я подвисаю… напиши ещё раз через минутку 🙏")
+            await message.answer(t(lang, "busy"))
         except anthropic.APIError:
             log.exception("Claude API error for %s", uid)
-            await message.answer("Что-то со связью у меня… напиши ещё раз, пожалуйста.")
+            await message.answer(t(lang, "api_error"))
 
     return router
 
 
-def _checkins_kb(on: bool) -> InlineKeyboardMarkup:
+def _checkins_kb(lang: str, on: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=("✅ " if on else "") + "Пиши мне первым", callback_data="checkins:on"),
-        InlineKeyboardButton(text=("✅ " if not on else "") + "Не пиши первым", callback_data="checkins:off"),
+        InlineKeyboardButton(text=("✅ " if on else "") + t(lang, "btn_checkins_on"), callback_data="checkins:on"),
+        InlineKeyboardButton(text=("✅ " if not on else "") + t(lang, "btn_checkins_off"), callback_data="checkins:off"),
     ]])
 
 
@@ -361,24 +374,24 @@ async def _content(message: Message, bot: Bot) -> list[dict]:
     elif message.document:
         doc = message.document
         if doc.mime_type not in IMAGE_TYPES:
-            raise ValueError("Я пока понимаю только текст, фото и стикеры 🙂")
+            raise UserFacingError("bad_file")
         blocks.append(_image(await _download(bot, doc.file_id, doc.file_size), doc.mime_type))
     elif message.sticker:
-        blocks.append({"type": "text", "text": f"[прислал(а) стикер {message.sticker.emoji or ''}]"})
+        blocks.append({"type": "text", "text": f"[sent a sticker {message.sticker.emoji or ''}]"})
 
     text = message.text or message.caption
     if message.forward_origin:
-        text = f"[пересланное сообщение]\n{text or ''}"
+        text = f"[forwarded message]\n{text or ''}"
     if text:
         blocks.append({"type": "text", "text": text})
     elif message.photo or message.document:
-        blocks.append({"type": "text", "text": "[прислал(а) фото без подписи]"})
+        blocks.append({"type": "text", "text": "[sent a photo without a caption]"})
     return blocks
 
 
 async def _download(bot: Bot, file_id: str, size: int | None) -> bytes:
     if size and size > MAX_FILE:
-        raise ValueError("Файл слишком большой, Telegram не даёт мне его открыть 😔")
+        raise UserFacingError("big_file")
     return (await bot.download(file_id)).read()
 
 

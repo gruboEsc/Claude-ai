@@ -14,6 +14,8 @@ from aiogram.exceptions import TelegramAPIError
 
 from .config import Config, Plan
 from .db import Storage
+from .i18n import companion_name
+from .i18n import companion_name
 from .yookassa import YooKassa, YooKassaError
 
 log = logging.getLogger(__name__)
@@ -34,7 +36,8 @@ class Billing:
         return self.yk is not None
 
     def description(self, plan: Plan) -> str:
-        return f"Подписка на общение с {self.cfg.companion_name}, {plan.days} дней"
+        name = companion_name("ru", self.cfg.companion_gender, self.cfg.companion_name)
+        return f"Подписка на общение с {name}, {plan.days} дней"
 
     async def start(self, bot: Bot, user_id: int, email: str, plan: Plan) -> str:
         """Create a payment and return the YooKassa page to pay on."""

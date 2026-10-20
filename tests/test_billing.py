@@ -182,6 +182,8 @@ def test_old_database_is_migrated(tmp_path):
         await storage.open()
         user = await storage.user(5)
         assert user.used == 7 and user.email is None and user.autopay == 0 and user.plan_days == 30
+        assert user.lang == "ru"  # pre-i18n users were all Russian-speaking
+        assert (await storage.user(6)).lang is None  # new users get theirs from Telegram
         await storage.close()
 
     run(scenario())

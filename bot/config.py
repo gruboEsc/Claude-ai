@@ -22,7 +22,7 @@ class Config:
     anthropic_api_key: str | None
     model: str = "claude-sonnet-5-5"
     effort: str = "low"
-    companion_name: str = "Аня"
+    companion_name: str = ""  # overrides the Russian companion's name; others are in i18n.LANGS
     companion_gender: str = "f"  # f | m
     max_tokens: int = 16000
     compact_at: int = 50000  # summarize the dialog once a request reaches this many input tokens (min 50k)
@@ -37,6 +37,8 @@ class Config:
     rub_30: int = 1790
     stars_14: int = 650
     stars_30: int = 1150  # the 30-day plan is a Stars subscription; Telegram has no 14-day ones
+    stars_14_t2: int = 300  # tier 2: lower-income markets (see i18n.LANGS)
+    stars_30_t2: int = 500
     support: str = ""
     # YooKassa (card / SBP / SberPay); disabled while shop id or secret is empty
     yk_shop_id: str = ""
@@ -44,8 +46,11 @@ class Config:
     vat_code: int = 1  # 54-FZ VAT code for receipts; 1 = without VAT
     yk_autopay: bool = False  # needs autopayments enabled for the shop by YooKassa
     # API spend cap per subscriber, so one person can't eat the whole budget
-    daily_limit_usd: float = 0.60  # hard cap for any single day
-    avg_daily_usd: float = 0.40  # budget for the paid period = days x this
+    # Sized so that even the heaviest user costs at most ~half of what their plan brings in.
+    daily_limit_usd: float = 0.50  # hard cap for any single day
+    avg_daily_usd: float = 0.30  # budget for the paid period = days x this
+    daily_limit_usd_t2: float = 0.20
+    avg_daily_usd_t2: float = 0.10
     # The companion writing first
     checkins: bool = True
     checkin_after_hours: int = 20
@@ -69,7 +74,7 @@ class Config:
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY") or None,
             model=os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5"),
             effort=effort,
-            companion_name=os.getenv("COMPANION_NAME", "Аня"),
+            companion_name=os.getenv("COMPANION_NAME", ""),
             companion_gender=gender,
             max_tokens=int(os.getenv("MAX_TOKENS", "16000")),
             compact_at=max(int(os.getenv("COMPACT_AT_TOKENS", "50000")), 50000),
@@ -83,29 +88,37 @@ class Config:
             rub_30=int(os.getenv("PRICE_RUB_30", "1790")),
             stars_14=int(os.getenv("PRICE_STARS_14", "650")),
             stars_30=int(os.getenv("PRICE_STARS_30", "1150")),
+            stars_14_t2=int(os.getenv("PRICE_STARS_14_T2", "300")),
+            stars_30_t2=int(os.getenv("PRICE_STARS_30_T2", "500")),
             support=os.getenv("SUPPORT_CONTACT", ""),
             yk_shop_id=os.getenv("YOOKASSA_SHOP_ID", ""),
             yk_secret=os.getenv("YOOKASSA_SECRET_KEY", ""),
             vat_code=int(os.getenv("YOOKASSA_VAT_CODE", "1")),
             yk_autopay=_flag("YOOKASSA_AUTOPAY", "0"),
-            daily_limit_usd=float(os.getenv("DAILY_LIMIT_USD", "0.60")),
-            avg_daily_usd=float(os.getenv("AVG_DAILY_LIMIT_USD", "0.40")),
+            daily_limit_usd=float(os.getenv("DAILY_LIMIT_USD", "0.50")),
+            avg_daily_usd=float(os.getenv("AVG_DAILY_LIMIT_USD", "0.30")),
+            daily_limit_usd_t2=float(os.getenv("DAILY_LIMIT_USD_T2", "0.20")),
+            avg_daily_usd_t2=float(os.getenv("AVG_DAILY_LIMIT_USD_T2", "0.10")),
             checkins=_flag("CHECKINS", "1"),
             checkin_after_hours=int(os.getenv("CHECKIN_AFTER_HOURS", "20")),
             checkin_from_hour=int(os.getenv("CHECKIN_FROM_HOUR", "10")),
             checkin_to_hour=int(os.getenv("CHECKIN_TO_HOUR", "21")),
         )
 
-    def plans(self) -> dict[int, "Plan"]:
-        return {
-            14: Plan(14, "2 недели", self.rub_14, self.stars_14),
-            30: Plan(30, "Месяц", self.rub_30, self.stars_30),
-        }
+    def plans(self, tier: int = 1) -> dict[int, "Plan"]:
+        if tier == 2:
+            return {14: Plan(14, self.rub_14, self.stars_14_t2), 30: Plan(30, self.rub_30, self.stars_30_t2)}
+        return {14: Plan(14, self.rub_14, self.stars_14), 30: Plan(30, self.rub_30, self.stars_30)}
+
+    def limits(self, tier: int = 1) -> tuple[float, float]:
+        """(daily cap, average daily budget) in USD for a price tier."""
+        if tier == 2:
+            return self.daily_limit_usd_t2, self.avg_daily_usd_t2
+        return self.daily_limit_usd, self.avg_daily_usd
 
 
 @dataclass(frozen=True)
 class Plan:
     days: int
-    title: str
     rub: int
     stars: int

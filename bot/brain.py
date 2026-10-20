@@ -11,6 +11,7 @@ from aiogram.exceptions import TelegramForbiddenError
 
 from .claude import Claude, usd
 from .companion import build_system, stamp
+from .i18n import LANGS, companion_name, lang_of, t
 from .config import Config
 from .db import Storage, User
 from .tools import Tools
@@ -40,14 +41,25 @@ class Companion:
     def subscribed(self, user: User) -> bool:
         return user.user_id in self.cfg.admin_ids or user.paid_until > time.time()
 
+    @staticmethod
+    def lang(user: User) -> str:
+        return lang_of(user.lang)
+
+    def tier(self, user: User) -> int:
+        return LANGS[self.lang(user)].tier
+
+    def name(self, user: User) -> str:
+        return companion_name(self.lang(user), self.cfg.companion_gender, self.cfg.companion_name)
+
     async def over_limit(self, user: User) -> tuple[str, datetime] | None:
         """('day' | 'period', when it resets) once a subscriber has used up their API budget."""
         now = time.time()
         if user.user_id in self.cfg.admin_ids or user.paid_until <= now:
             return None  # admins are unlimited; the trial is limited by message count instead
+        daily, avg_daily = self.cfg.limits(self.tier(user))
         tz = await self.tools.tz(user.user_id)
         today = datetime.now(tz)
-        if await self.storage.spent(user.user_id, today.date().isoformat()) >= self.cfg.daily_limit_usd:
+        if await self.storage.spent(user.user_id, today.date().isoformat()) >= daily:
             tomorrow = (today + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
             return "day", tomorrow
         # Budget for the current paid period; when several are paid ahead, the latest stretch
@@ -57,7 +69,7 @@ class Companion:
         if start > now:
             start = now - period
         start_day = datetime.fromtimestamp(start, tz)
-        budget = user.plan_days * self.cfg.avg_daily_usd
+        budget = user.plan_days * avg_daily
         if await self.storage.spent(user.user_id, start_day.date().isoformat()) >= budget:
             return "period", start_day + timedelta(seconds=period)
         return None
@@ -69,7 +81,7 @@ class Companion:
             return user.system
         tz = await self.tools.tz(user.user_id)
         system = build_system(
-            self.cfg.companion_name, self.cfg.companion_gender, await self.storage.notes(user.user_id), str(tz)
+            self.name(user), self.cfg.companion_gender, self.lang(user), await self.storage.notes(user.user_id), str(tz)
         )
         await self.storage.update(user.user_id, system=system)
         return system
@@ -101,7 +113,7 @@ class Companion:
                 # Not saved, so the dialog continues as if this turn never happened.
                 if proactive:
                     return False
-                return await self._send(bot, user_id, ["Давай об этом не будем 🙂 Расскажи лучше, как ты?"])
+                return await self._send(bot, user_id, [t(self.lang(user), "refusal")])
 
             await self.storage.append(user_id, [user_turn, *reply.turns])
             if reply.compacted:
@@ -146,7 +158,7 @@ class Companion:
             user = await self.storage.user(user_id)
             if user.blocked or not self.has_access(user) or await self.over_limit(user):
                 continue
-            await self.write_first(bot, user_id, f"[Служебно: пора написать человеку самому. Повод: {reason}]")
+            await self.write_first(bot, user_id, f"[Service note: time to write to the person yourself. Reason: {reason}]")
 
         if not self.cfg.checkins:
             return
@@ -160,9 +172,9 @@ class Companion:
             await self.write_first(
                 bot,
                 user.user_id,
-                f"[Служебно: человек не писал около {hours} ч. Напиши первым — коротко и тепло, "
-                "без упрёков и без вопросов, почему пропал. Можно вспомнить что-то из ваших "
-                "разговоров или просто поделиться мыслью.]",
+                f"[Service note: the person hasn't written for about {hours} h. Write first — briefly and "
+                "warmly, without reproach and without asking why they disappeared. You can recall something "
+                "from your talks or just share a thought.]",
             )
 
 
