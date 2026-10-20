@@ -22,6 +22,7 @@ class Config:
     web_search: bool = True
     allowed_users: frozenset[int] = field(default_factory=frozenset)
     db_path: str = "data/bot.db"
+    timezone: str = "Europe/Moscow"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -41,4 +42,5 @@ class Config:
             web_search=os.getenv("WEB_SEARCH", "1") not in ("0", "false", "no"),
             allowed_users=_ids(os.getenv("ALLOWED_USERS", "")),
             db_path=os.getenv("DB_PATH", "data/bot.db"),
+            timezone=os.getenv("TIMEZONE", "Europe/Moscow"),
         )

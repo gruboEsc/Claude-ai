@@ -21,6 +21,14 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_chat ON messages(chat_id, id);
+CREATE TABLE IF NOT EXISTS reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    due INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    done INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS reminders_due ON reminders(done, due);
 """
 
 
@@ -90,6 +98,36 @@ class Storage:
             f"ON CONFLICT(chat_id) DO UPDATE SET {field} = excluded.{field}",
             (chat_id, value),
         )
+        await self.conn.commit()
+
+    async def add_reminder(self, chat_id: int, due: int, text: str) -> int:
+        cur = await self.conn.execute(
+            "INSERT INTO reminders (chat_id, due, text) VALUES (?, ?, ?)", (chat_id, due, text)
+        )
+        await self.conn.commit()
+        return cur.lastrowid
+
+    async def pending_reminders(self, chat_id: int) -> list[tuple[int, int, str]]:
+        cur = await self.conn.execute(
+            "SELECT id, due, text FROM reminders WHERE chat_id = ? AND done = 0 ORDER BY due", (chat_id,)
+        )
+        return await cur.fetchall()
+
+    async def cancel_reminder(self, chat_id: int, rid: int) -> bool:
+        cur = await self.conn.execute(
+            "UPDATE reminders SET done = 1 WHERE id = ? AND chat_id = ? AND done = 0", (rid, chat_id)
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def due_reminders(self, now: int) -> list[tuple[int, int, str]]:
+        cur = await self.conn.execute(
+            "SELECT id, chat_id, text FROM reminders WHERE done = 0 AND due <= ? ORDER BY due", (now,)
+        )
+        return await cur.fetchall()
+
+    async def finish_reminder(self, rid: int) -> None:
+        await self.conn.execute("UPDATE reminders SET done = 1 WHERE id = ?", (rid,))
         await self.conn.commit()
 
     async def add_usage(self, chat_id: int, inp: int, out: int, cached: int) -> None:
