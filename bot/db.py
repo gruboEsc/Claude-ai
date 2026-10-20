@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS users (
     email TEXT,                                -- for YooKassa receipts
     pay_method_id TEXT,                        -- saved YooKassa method for renewals
     autopay INTEGER NOT NULL DEFAULT 0,
-    awaiting_email INTEGER NOT NULL DEFAULT 0
+    awaiting_email INTEGER NOT NULL DEFAULT 0,   -- plan days to pay for once the email arrives
+    plan_days INTEGER NOT NULL DEFAULT 30        -- length of the plan last paid for
 );
 CREATE TABLE IF NOT EXISTS dialog (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,7 +60,8 @@ CREATE TABLE IF NOT EXISTS yk_payments (
     amount TEXT NOT NULL,
     status TEXT NOT NULL,
     renewal INTEGER NOT NULL,
-    created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER))
+    created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER)),
+    days INTEGER NOT NULL DEFAULT 30
 );
 CREATE INDEX IF NOT EXISTS yk_pending ON yk_payments(status);
 CREATE TABLE IF NOT EXISTS spend (
@@ -70,13 +72,18 @@ CREATE TABLE IF NOT EXISTS spend (
 );
 """
 
-# Columns added after the first release, appended to existing databases in this order.
-USER_MIGRATIONS = [
-    ("email", "TEXT"),
-    ("pay_method_id", "TEXT"),
-    ("autopay", "INTEGER NOT NULL DEFAULT 0"),
-    ("awaiting_email", "INTEGER NOT NULL DEFAULT 0"),
-]
+# Columns added after a table was first released, appended to existing databases in
+# this order (so they line up with the CREATE TABLE statements above).
+MIGRATIONS = {
+    "users": [
+        ("email", "TEXT"),
+        ("pay_method_id", "TEXT"),
+        ("autopay", "INTEGER NOT NULL DEFAULT 0"),
+        ("awaiting_email", "INTEGER NOT NULL DEFAULT 0"),
+        ("plan_days", "INTEGER NOT NULL DEFAULT 30"),
+    ],
+    "yk_payments": [("days", "INTEGER NOT NULL DEFAULT 30")],
+}
 
 MAX_NOTES = 150
 
@@ -102,6 +109,7 @@ class User:
     pay_method_id: str | None
     autopay: int
     awaiting_email: int
+    plan_days: int
 
 
 class Storage:
@@ -114,10 +122,11 @@ class Storage:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
         self.conn = await aiosqlite.connect(self.path)
         await self.conn.executescript(SCHEMA)
-        have = {row[1] for row in await self._all("PRAGMA table_info(users)")}
-        for col, decl in USER_MIGRATIONS:
-            if col not in have:
-                await self.conn.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
+        for table, columns in MIGRATIONS.items():
+            have = {row[1] for row in await self._all(f"PRAGMA table_info({table})")}
+            for col, decl in columns:
+                if col not in have:
+                    await self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         await self.conn.commit()
 
     async def close(self) -> None:
@@ -241,23 +250,27 @@ class Storage:
         )
         return cur.rowcount > 0
 
-    async def extend(self, user_id: int, seconds: int, now: int) -> int:
-        """Add paid time on top of whatever is left; returns the new paid_until."""
+    async def extend(self, user_id: int, days: int, now: int) -> int:
+        """Add a plan's days on top of whatever is left; returns the new paid_until."""
         user = await self.user(user_id)
-        until = max(user.paid_until, now) + seconds
-        await self.update(user_id, paid_until=until)
+        until = max(user.paid_until, now) + days * 86400
+        await self.update(user_id, paid_until=until, plan_days=days)
         return until
 
     # YooKassa
 
-    async def add_yk_payment(self, pid: str, user_id: int, amount: str, status: str, renewal: bool) -> None:
+    async def add_yk_payment(
+        self, pid: str, user_id: int, amount: str, status: str, renewal: bool, days: int
+    ) -> None:
         await self._exec(
-            "INSERT OR IGNORE INTO yk_payments (id, user_id, amount, status, renewal) VALUES (?, ?, ?, ?, ?)",
-            (pid, user_id, amount, status, int(renewal)),
+            "INSERT OR IGNORE INTO yk_payments (id, user_id, amount, status, renewal, days) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (pid, user_id, amount, status, int(renewal), days),
         )
 
-    async def pending_yk(self, user_id: int | None = None) -> list[tuple[str, int, int, int]]:
-        sql = "SELECT id, user_id, renewal, created_at FROM yk_payments WHERE status IN ('pending', 'waiting_for_capture')"
+    async def pending_yk(self, user_id: int | None = None) -> list[tuple[str, int, int, int, int]]:
+        sql = ("SELECT id, user_id, renewal, created_at, days FROM yk_payments "
+               "WHERE status IN ('pending', 'waiting_for_capture')")
         if user_id is None:
             return await self._all(sql)
         return await self._all(sql + " AND user_id = ?", (user_id,))

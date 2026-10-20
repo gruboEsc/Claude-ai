@@ -12,13 +12,12 @@ from datetime import datetime, timezone
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 
-from .config import Config
+from .config import Config, Plan
 from .db import Storage
 from .yookassa import YooKassa, YooKassaError
 
 log = logging.getLogger(__name__)
 
-SUB_PERIOD = 30 * 24 * 3600
 TICK = 60
 PENDING_TTL = 2 * 86400  # stop polling a payment nobody completed
 RENEW_AHEAD = 86400  # charge a saved card this long before the paid period ends
@@ -34,39 +33,41 @@ class Billing:
     def enabled(self) -> bool:
         return self.yk is not None
 
-    def description(self) -> str:
-        return f"Подписка на общение с {self.cfg.companion_name}, 30 дней"
+    def description(self, plan: Plan) -> str:
+        return f"Подписка на общение с {self.cfg.companion_name}, {plan.days} дней"
 
-    async def start(self, bot: Bot, user_id: int, email: str) -> str:
+    async def start(self, bot: Bot, user_id: int, email: str, plan: Plan) -> str:
         """Create a payment and return the YooKassa page to pay on."""
         me = await bot.get_me()
         payment = await self.yk.create_payment(
-            rub=self.cfg.price_rub,
-            description=self.description(),
+            rub=plan.rub,
+            description=self.description(plan),
             user_id=user_id,
             email=email,
             vat_code=self.cfg.vat_code,
             return_url=f"https://t.me/{me.username}",
             save_method=self.cfg.yk_autopay,
         )
-        await self.storage.add_yk_payment(payment["id"], user_id, payment["amount"]["value"], payment["status"], False)
+        await self.storage.add_yk_payment(
+            payment["id"], user_id, payment["amount"]["value"], payment["status"], False, plan.days
+        )
         return payment["confirmation"]["confirmation_url"]
 
     async def check_user(self, bot: Bot, user_id: int) -> bool:
         """Check this person's pending payments now; True if one went through."""
         paid = False
-        for pid, _, renewal, _ in await self.storage.pending_yk(user_id):
-            paid |= await self._check(bot, pid, user_id, bool(renewal)) == "succeeded"
+        for pid, _, renewal, _, days in await self.storage.pending_yk(user_id):
+            paid |= await self._check(bot, pid, user_id, bool(renewal), days) == "succeeded"
         return paid
 
-    async def _check(self, bot: Bot, pid: str, user_id: int, renewal: bool) -> str:
+    async def _check(self, bot: Bot, pid: str, user_id: int, renewal: bool, days: int) -> str:
         payment = await self.yk.get_payment(pid)
         status = payment["status"]
         if status not in ("succeeded", "canceled") or not await self.storage.settle_yk(pid, status):
             return status
 
         if status == "succeeded":
-            until = await self.storage.extend(user_id, SUB_PERIOD, int(time.time()))
+            until = await self.storage.extend(user_id, days, int(time.time()))
             method = payment.get("payment_method") or {}
             if self.cfg.yk_autopay and method.get("saved"):
                 await self.storage.update(user_id, pay_method_id=method["id"], autopay=1)
@@ -89,12 +90,12 @@ class Billing:
 
     async def tick(self, bot: Bot) -> None:
         now = int(time.time())
-        for pid, user_id, renewal, created_at in await self.storage.pending_yk():
+        for pid, user_id, renewal, created_at, days in await self.storage.pending_yk():
             if now - created_at > PENDING_TTL:
                 await self.storage.settle_yk(pid, "expired")
                 continue
             try:
-                await self._check(bot, pid, user_id, bool(renewal))
+                await self._check(bot, pid, user_id, bool(renewal), days)
             except YooKassaError as e:
                 log.warning("checking payment %s failed: %s", pid, e)
 
@@ -103,10 +104,12 @@ class Billing:
         for user in await self.storage.renewal_candidates(now, RENEW_AHEAD):
             if not user.email:
                 continue
+            # Renew the plan the person last chose.
+            plan = self.cfg.plans().get(user.plan_days) or self.cfg.plans()[30]
             try:
                 payment = await self.yk.create_payment(
-                    rub=self.cfg.price_rub,
-                    description=self.description(),
+                    rub=plan.rub,
+                    description=self.description(plan),
                     user_id=user.user_id,
                     email=user.email,
                     vat_code=self.cfg.vat_code,
@@ -116,7 +119,7 @@ class Billing:
                 log.warning("renewal for %s failed: %s", user.user_id, e)
                 continue
             await self.storage.add_yk_payment(
-                payment["id"], user.user_id, payment["amount"]["value"], "pending", True
+                payment["id"], user.user_id, payment["amount"]["value"], "pending", True, plan.days
             )
 
     async def run_forever(self, bot: Bot) -> None:

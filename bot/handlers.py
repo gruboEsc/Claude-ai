@@ -18,7 +18,7 @@ from aiogram.types import (
     PreCheckoutQuery,
 )
 
-from .billing import SUB_PERIOD, Billing
+from .billing import Billing
 from .brain import Companion
 from .claude import cost
 from .config import Config
@@ -26,6 +26,7 @@ from .yookassa import YooKassaError
 
 log = logging.getLogger(__name__)
 
+SUB_PERIOD = 30 * 86400  # the only Stars subscription period Telegram supports
 MAX_FILE = 20 * 1024 * 1024  # Bot API download limit
 IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -40,43 +41,56 @@ def setup(cfg: Config, companion: Companion, billing: Billing) -> Router:
     def allowed(user_id: int) -> bool:
         return not cfg.allowed_users or user_id in cfg.allowed_users or user_id in cfg.admin_ids
 
+    plans = cfg.plans()
+
     def prices() -> str:
-        rub = f" или {cfg.price_rub} ₽" if billing.enabled else ""
-        return f"{cfg.price_stars} ⭐{rub} за 30 дней"
+        return "; ".join(
+            f"{p.title.lower()} — {p.rub} ₽ или {p.stars} ⭐" if billing.enabled else f"{p.title.lower()} — {p.stars} ⭐"
+            for p in plans.values()
+        )
 
     async def paywall(message: Message) -> None:
         await message.answer(
             f"Бесплатные сообщения закончились.\n\n"
-            f"Чтобы продолжить общение с {name}, оформи подписку: {prices()}. "
-            "Отменить продление можно в любой момент в /status.",
+            f"Чтобы продолжить общение с {name}, выбери подписку: {prices()}.",
             reply_markup=await _subscribe_kb(message.bot),
         )
 
-    async def _subscribe_kb(bot: Bot) -> InlineKeyboardMarkup:
-        link = await bot.create_invoice_link(
-            title=f"Подписка: общение с {name}",
-            description="Общение на 30 дней, сообщения первым и напоминания. Продлевается автоматически.",
-            payload="sub",
+    async def _stars_link(bot: Bot, days: int) -> str:
+        plan = plans[days]
+        monthly = days == 30  # Telegram only has 30-day Stars subscriptions
+        return await bot.create_invoice_link(
+            title=f"{name}: {plan.title.lower()}",
+            description=f"Общение на {days} дней, сообщения первым и напоминания."
+                        + (" Продлевается автоматически." if monthly else ""),
+            payload=f"plan{days}",
             currency="XTR",
-            prices=[LabeledPrice(label="30 дней", amount=cfg.price_stars)],
-            subscription_period=SUB_PERIOD,
+            prices=[LabeledPrice(label=f"{days} дней", amount=plan.stars)],
+            subscription_period=SUB_PERIOD if monthly else None,
         )
-        rows = [[InlineKeyboardButton(text=f"⭐ Telegram Stars — {cfg.price_stars}", url=link)]]
-        if billing.enabled:
-            rows.append([InlineKeyboardButton(text=f"💳 Картой или СБП — {cfg.price_rub} ₽", callback_data="yk:pay")])
+
+    async def _subscribe_kb(bot: Bot) -> InlineKeyboardMarkup:
+        rows = []
+        for days, plan in plans.items():
+            row = []
+            if billing.enabled:
+                row.append(InlineKeyboardButton(text=f"💳 {plan.title} — {plan.rub} ₽", callback_data=f"yk:pay:{days}"))
+            row.append(InlineKeyboardButton(text=f"⭐ {plan.title} — {plan.stars}", url=await _stars_link(bot, days)))
+            rows.append(row)
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    async def send_payment_link(message: Message, bot: Bot, user_id: int, email: str) -> None:
+    async def send_payment_link(message: Message, bot: Bot, user_id: int, email: str, days: int) -> None:
+        plan = plans[days]
         try:
-            url = await billing.start(bot, user_id, email)
+            url = await billing.start(bot, user_id, email, plan)
         except YooKassaError as e:
             log.error("YooKassa payment for %s failed: %s", user_id, e)
             await message.answer("Не получилось создать платёж 😔 Попробуй чуть позже или оплати звёздами.")
             return
-        consent = (" Оплачивая, ты соглашаешься на автопродление: каждые 30 дней с карты будет списываться "
-                   f"{cfg.price_rub} ₽. Отключить можно в /status." if cfg.yk_autopay else "")
+        consent = (f" Оплачивая, ты соглашаешься на автопродление: каждые {days} дней с карты будет списываться "
+                   f"{plan.rub} ₽. Отключить можно в /status." if cfg.yk_autopay else "")
         await message.answer(
-            f"Подписка на 30 дней — {cfg.price_rub} ₽. Чек придёт на {email}.{consent}\n\n"
+            f"Подписка на {days} дней — {plan.rub} ₽. Чек придёт на {email}.{consent}\n\n"
             "После оплаты вернись сюда — я сам замечу платёж в течение минуты, или нажми «Я оплатил».",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="💳 Перейти к оплате", url=url)],
@@ -115,7 +129,8 @@ def setup(cfg: Config, companion: Companion, billing: Billing) -> Router:
             until = datetime.fromtimestamp(user.paid_until, timezone.utc).astimezone(await companion.tools.tz(user.user_id))
             text = f"✨ Подписка активна до {until:%d.%m.%Y}."
             if user.autopay:
-                text += f"\nАвтопродление с карты включено: {cfg.price_rub} ₽ раз в 30 дней."
+                plan = plans.get(user.plan_days, plans[30])
+                text += f"\nАвтопродление с карты включено: {plan.rub} ₽ раз в {plan.days} дней."
             rows = []
             if user.charge_id or user.autopay:
                 rows.append([InlineKeyboardButton(text="Отменить продление", callback_data="unsub")])
@@ -154,14 +169,17 @@ def setup(cfg: Config, companion: Companion, billing: Billing) -> Router:
         await cb.message.edit_text("Продление отменено. Подписка будет работать до конца оплаченного срока.")
         await cb.answer()
 
-    @router.callback_query(F.data == "yk:pay")
+    @router.callback_query(F.data.startswith("yk:pay:"))
     async def on_yk_pay(cb: CallbackQuery, bot: Bot) -> None:
         await cb.answer()
+        days = int(cb.data.rsplit(":", 1)[1])
+        if days not in plans:
+            return
         user = await storage.user(cb.from_user.id)
         if user.email:
-            await send_payment_link(cb.message, bot, user.user_id, user.email)
+            await send_payment_link(cb.message, bot, user.user_id, user.email, days)
             return
-        await storage.update(user.user_id, awaiting_email=1)
+        await storage.update(user.user_id, awaiting_email=days)
         await cb.message.answer("Пришли, пожалуйста, email — на него придёт чек об оплате (так требует закон).")
 
     @router.callback_query(F.data == "yk:check")
@@ -230,7 +248,8 @@ def setup(cfg: Config, companion: Companion, billing: Billing) -> Router:
         await message.answer(
             f"{name} — ИИ-собеседник для дружеского общения. Это не медицинская и не психологическая помощь. "
             "Переписка и заметки хранятся на сервере, чтобы собеседник помнил контекст; стереть их — /forget. "
-            f"Подписка — {prices()}, с автопродлением; отмена в /status. "
+            f"Подписка: {prices()}. Месячная через Stars (и через карту, если включено автопродление) "
+            "продлевается автоматически; отмена в /status. "
             f"В подписке есть разумный лимит общения в день и в месяц — его хватает на долгие ежедневные разговоры. "
             "В экстренной ситуации звони 112."
         )
@@ -268,11 +287,13 @@ def setup(cfg: Config, companion: Companion, billing: Billing) -> Router:
         if not await storage.record_payment(p.telegram_payment_charge_id, uid, p.total_amount, bool(p.is_recurring)):
             return  # duplicate delivery
         user = await storage.user(uid)
+        days = 14 if p.invoice_payload == "plan14" else 30
         if p.subscription_expiration_date:
             # Never shorten time already paid another way (e.g. through YooKassa).
-            await storage.update(uid, paid_until=max(int(p.subscription_expiration_date), user.paid_until))
+            until = max(int(p.subscription_expiration_date), user.paid_until)
+            await storage.update(uid, paid_until=until, plan_days=days)
         else:
-            await storage.extend(uid, SUB_PERIOD, int(time.time()))
+            await storage.extend(uid, days, int(time.time()))
         await storage.update(uid, charge_id=p.telegram_payment_charge_id)
         if not p.is_recurring or p.is_first_recurring:
             await message.answer("Спасибо! ⭐ Подписка оформлена — теперь можно общаться без ограничений.")
@@ -291,9 +312,9 @@ def setup(cfg: Config, companion: Companion, billing: Billing) -> Router:
         if user.awaiting_email:
             await storage.update(uid, awaiting_email=0)
             text = (message.text or "").strip()
-            if EMAIL.match(text):
+            if EMAIL.match(text) and user.awaiting_email in plans:
                 await storage.update(uid, email=text)
-                await send_payment_link(message, bot, uid, text)
+                await send_payment_link(message, bot, uid, text, user.awaiting_email)
                 return
             # Not an email: they changed their mind, so treat it as a normal message.
         if not companion.has_access(user):
@@ -305,7 +326,7 @@ def setup(cfg: Config, companion: Companion, billing: Billing) -> Router:
             await message.answer(
                 "Мы сегодня очень много проговорили 🙂 Дневной лимит общения закончился — "
                 "давай продолжим завтра, я буду ждать." if kind == "day" else
-                f"Лимит общения на этот месяц закончился. Он обновится {resets:%d.%m}."
+                f"Лимит общения на этот оплаченный срок закончился. Он обновится {resets:%d.%m}."
             )
             return
         try:

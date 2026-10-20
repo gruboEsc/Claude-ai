@@ -9,7 +9,6 @@ from aiogram import Bot
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramForbiddenError
 
-from .billing import SUB_PERIOD
 from .claude import Claude, usd
 from .companion import build_system, stamp
 from .config import Config
@@ -42,7 +41,7 @@ class Companion:
         return user.user_id in self.cfg.admin_ids or user.paid_until > time.time()
 
     async def over_limit(self, user: User) -> tuple[str, datetime] | None:
-        """('day' | 'month', when it resets) once a subscriber has used up their API budget."""
+        """('day' | 'period', when it resets) once a subscriber has used up their API budget."""
         now = time.time()
         if user.user_id in self.cfg.admin_ids or user.paid_until <= now:
             return None  # admins are unlimited; the trial is limited by message count instead
@@ -51,13 +50,16 @@ class Companion:
         if await self.storage.spent(user.user_id, today.date().isoformat()) >= self.cfg.daily_limit_usd:
             tomorrow = (today + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
             return "day", tomorrow
-        # The current paid month; when several months are paid ahead, the last 30 days.
-        start = user.paid_until - SUB_PERIOD
+        # Budget for the current paid period; when several are paid ahead, the latest stretch
+        # of the same length.
+        period = user.plan_days * 86400
+        start = user.paid_until - period
         if start > now:
-            start = now - SUB_PERIOD
+            start = now - period
         start_day = datetime.fromtimestamp(start, tz)
-        if await self.storage.spent(user.user_id, start_day.date().isoformat()) >= self.cfg.monthly_limit_usd:
-            return "month", start_day + timedelta(seconds=SUB_PERIOD)
+        budget = user.plan_days * self.cfg.avg_daily_usd
+        if await self.storage.spent(user.user_id, start_day.date().isoformat()) >= budget:
+            return "period", start_day + timedelta(seconds=period)
         return None
 
     async def _system(self, user: User, refresh: bool = False) -> str:

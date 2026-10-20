@@ -4,7 +4,7 @@ import time
 from dataclasses import replace
 from datetime import datetime, timedelta
 
-from bot.billing import SUB_PERIOD, Billing
+from bot.billing import Billing
 from bot.brain import Companion
 from bot.config import Config
 from bot.db import Storage
@@ -12,7 +12,9 @@ from bot.tools import Tools
 from tests.test_companion import FakeBot, FakeClaude
 
 CFG = Config(telegram_token="x", anthropic_api_key="k", web_search=False,
-             daily_limit_usd=0.40, monthly_limit_usd=1.00)
+             daily_limit_usd=0.40, avg_daily_usd=0.10)
+PLANS = CFG.plans()
+DAY = 86400
 
 
 def run(coro):
@@ -58,21 +60,29 @@ def test_payment_by_link_extends_once(tmp_path):
         billing = Billing(CFG, storage, yk)
         bot = Bot()
         await storage.user(1)
-        url = await billing.start(bot, 1, "a@b.ru")
+        url = await billing.start(bot, 1, "a@b.ru", PLANS[30])
         assert url.endswith("/p1")
-        assert yk.created[0]["email"] == "a@b.ru" and yk.created[0]["rub"] == 490
+        assert yk.created[0]["email"] == "a@b.ru" and yk.created[0]["rub"] == 1790
         assert yk.created[0]["return_url"] == "https://t.me/companion_bot"
 
         assert not await billing.check_user(bot, 1)  # still pending
         yk.status["p1"] = "succeeded"
         assert await billing.check_user(bot, 1)
         paid_until = (await storage.user(1)).paid_until
-        assert abs(paid_until - (time.time() + SUB_PERIOD)) < 5
+        assert abs(paid_until - (time.time() + 30 * DAY)) < 5
         await billing.tick(bot)  # already settled: no second extension
         assert (await storage.user(1)).paid_until == paid_until
         assert "Спасибо" in bot.sent[0][1] and len(bot.sent) == 1
         # autopay is off by default, so the card is not kept
         assert (await storage.user(1)).autopay == 0
+
+        # a two-week plan bought on top adds 14 days and becomes the current plan
+        await billing.start(bot, 1, "a@b.ru", PLANS[14])
+        assert yk.created[1]["rub"] == 990 and "14 дней" in yk.created[1]["description"]
+        yk.status["p2"] = "succeeded"
+        await billing.tick(bot)
+        user = await storage.user(1)
+        assert user.paid_until == paid_until + 14 * DAY and user.plan_days == 14
         await storage.close()
 
     run(scenario())
@@ -86,7 +96,7 @@ def test_autopay_renewal_and_decline(tmp_path):
         bot = Bot()
         await storage.user(2)
         await storage.update(2, email="c@d.ru")
-        await billing.start(bot, 2, "c@d.ru")
+        await billing.start(bot, 2, "c@d.ru", PLANS[14])
         assert yk.created[0]["save_method"] is True
         yk.status["p1"] = "succeeded"
         await billing.tick(bot)
@@ -99,6 +109,7 @@ def test_autopay_renewal_and_decline(tmp_path):
         await billing.tick(bot)
         renewals = [c for c in yk.created if c.get("method_id")]
         assert len(renewals) == 1 and renewals[0]["method_id"] == "card-1"
+        assert renewals[0]["rub"] == 990  # renews the plan last chosen
 
         yk.status["p2"] = "canceled"
         await billing.tick(bot)
@@ -119,7 +130,8 @@ def test_spend_limits(tmp_path):
         user = await storage.user(3)
         assert await companion.over_limit(user) is None  # trial: limited by message count
 
-        await storage.update(3, paid_until=now + SUB_PERIOD - 86400 * 5)
+        # 30-day plan, 5 days in: period budget = 30 x $0.10 = $3.00
+        await storage.update(3, paid_until=now + 25 * DAY, plan_days=30)
         user = await storage.user(3)
         today = datetime.now(await companion.tools.tz(3)).date()
         await storage.add_spend(3, today.isoformat(), 0.39)
@@ -127,13 +139,18 @@ def test_spend_limits(tmp_path):
         await storage.add_spend(3, today.isoformat(), 0.02)
         assert (await companion.over_limit(user))[0] == "day"
 
-        # earlier days of this paid month count toward the monthly cap
-        await storage.add_spend(3, (today - timedelta(days=2)).isoformat(), 0.70)
+        # earlier days of this paid period count toward its budget
+        await storage.add_spend(3, (today - timedelta(days=2)).isoformat(), 2.70)
         await storage.add_spend(3, (today - timedelta(days=60)).isoformat(), 5.00)  # previous period
         await storage.conn.execute("DELETE FROM spend WHERE user_id = 3 AND day = ?", (today.isoformat(),))
-        assert await companion.over_limit(user) is None  # 0.70 < 1.00
+        assert await companion.over_limit(user) is None  # 2.70 < 3.00
         await storage.add_spend(3, today.isoformat(), 0.31)
-        assert (await companion.over_limit(user))[0] == "month"
+        kind, resets = await companion.over_limit(user)
+        assert kind == "period" and abs(resets.timestamp() - (now + 25 * DAY)) < DAY
+
+        # a 14-day plan has a 14 x $0.10 = $1.40 budget over its own 14 days
+        await storage.update(3, paid_until=now + 10 * DAY, plan_days=14)
+        assert (await companion.over_limit(await storage.user(3)))[0] == "period"
 
         bot = FakeBot()
         await companion.converse(bot, 3, [{"type": "text", "text": "hi"}])
@@ -164,7 +181,7 @@ def test_old_database_is_migrated(tmp_path):
         storage = Storage(str(path))
         await storage.open()
         user = await storage.user(5)
-        assert user.used == 7 and user.email is None and user.autopay == 0
+        assert user.used == 7 and user.email is None and user.autopay == 0 and user.plan_days == 30
         await storage.close()
 
     run(scenario())
