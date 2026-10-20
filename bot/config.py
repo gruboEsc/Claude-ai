@@ -20,7 +20,7 @@ def _flag(name: str, default: str) -> bool:
 class Config:
     telegram_token: str
     anthropic_api_key: str | None
-    model: str = "claude-opus-5-5"
+    model: str = "claude-sonnet-5-5"
     effort: str = "low"
     companion_name: str = "Аня"
     companion_gender: str = "f"  # f | m
@@ -64,7 +64,7 @@ class Config:
             telegram_token=token,
             # None -> the SDK falls back to its own credential chain
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY") or None,
-            model=os.getenv("CLAUDE_MODEL", "claude-opus-5-5"),
+            model=os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5"),
             effort=effort,
             companion_name=os.getenv("COMPANION_NAME", "Аня"),
             companion_gender=gender,
